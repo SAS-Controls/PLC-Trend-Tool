@@ -2329,11 +2329,11 @@ class PLCTrendTool(ctk.CTk):
                 tag_idx = tags.index(tag) if tag in tags else i
                 lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
-                line, = ax.plot(times, vals, label=tag,
+                display_name = smart_tag_name(tag, display_tags)
+                line, = ax.plot(times, vals, label=display_name,
                                 color=lp["color"], linewidth=lp["width"],
                                 linestyle=lp["style"])
                 self.lines[tag] = line
-                display_name = smart_tag_name(tag, display_tags)
                 ax.set_ylabel(display_name, fontsize=8, color=text_color)
                 if self._show_legend:
                     ax.legend(loc="upper left", fontsize=7, facecolor=face_color,
@@ -2353,7 +2353,8 @@ class PLCTrendTool(ctk.CTk):
                 tag_idx = tags.index(tag) if tag in tags else i
                 lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
-                line, = self.ax.plot(times, vals, label=tag,
+                display_name = smart_tag_name(tag, display_tags)
+                line, = self.ax.plot(times, vals, label=display_name,
                                      color=lp["color"], linewidth=lp["width"],
                                      linestyle=lp["style"])
                 self.lines[tag] = line
