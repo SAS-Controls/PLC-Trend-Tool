@@ -3281,7 +3281,30 @@ class PLCTrendTool(ctk.CTk):
             # Atomic / trendable tag
             is_trendable = tag.get("trendable", False)
             bit_count = BIT_ADDRESSABLE_TYPES.get(tag["dataType"], 0) if is_trendable else 0
-            if bit_count > 0:
+            dims = tag.get("array", 0)
+            if array_count and is_trendable and dims == 1:
+                # 1-D array of an atomic type (e.g. INT[60]) — expand to indexed
+                # elements [0]..[n-1]; integer elements can then drill to bits.
+                item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + name,
+                                               values=(f"{tag['dataType']}[{array_count}]",),
+                                               tags=("struct",))
+                self._struct_items[item_id] = {
+                    "path": full_path,
+                    "dtv": tag.get("dataTypeValue", 0),
+                    "array": array_count,
+                    "populated": False,
+                    "atomic_array": True,
+                    "dataType": tag["dataType"],
+                }
+                self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+            elif array_count and dims > 1:
+                # Multi-dimensional arrays: the tag list only reports the first
+                # dimension, so element addresses can't be built reliably.
+                self.tag_tree.insert(parent, "end",
+                                     text=f"  {name}  (multi-dim array not supported)",
+                                     values=(f"{tag['dataType']}[{array_count},...]",),
+                                     tags=("disabled",))
+            elif bit_count > 0:
                 # Integer type — make expandable for bit-level access
                 item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + name,
                                                values=(tag["dataType"],), tags=("struct",))
