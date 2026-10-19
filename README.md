@@ -19,8 +19,8 @@ Built by [Southern Automation Solutions](https://southernautomationsolutions.com
 
 1. Copy `PLC_Trend_Tool.exe` to any Windows 10/11 PC
 2. Double-click to run — no installation required
-3. Enter the controller IP address and click **Connect**
-4. Verify the connection details on the PLC Connection page
+3. Enter the controller IP address and click **Connect** (use **+ Add Controller** for more PLCs — each row connects on its own)
+4. Verify the connection details under each controller row on the PLC Connection page
 5. Navigate to the Trend view using the sidebar
 6. Select tags from the built-in tag browser panel
 7. Click **▶ Start Trend** to begin collecting data
@@ -47,6 +47,7 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 ## Features
 
 ### PLC Connection
+- **Multiple controllers at once** — up to 8 rows, each with its own name, controller type, IP, slot, and **Connect / Disconnect** button; rows operate independently and can mix controller families
 - Supports Allen-Bradley **ControlLogix**, **CompactLogix**, **Micro800**, **SLC 500**, **MicroLogix**, and **PLC-5** controllers
 - Configurable processor slot for multi-slot ControlLogix chassis
 - Validates connection with device identity query (Logix) or test read (SLC)
@@ -54,6 +55,7 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - Stays on the connection page after connecting so you can verify status before navigating
 
 ### Live Tag Browser
+- **Controller tabs** — one animated tab per connected controller across the top of the tag list; the selected tab is highlighted by a sliding pill, and each tab shows a status dot (green OK, blue loading, red no response) and its selected-tag count. Each controller keeps its own tree, expansion state, and search text
 - **Logix controllers:** Retrieves full controller and program-scoped tag lists with data types, including UDT and AOI expansion
 - **SLC 500 / MicroLogix / PLC-5:** Automatically scans all 256 data files to discover what exists — no manual address entry needed
   - Probes default files (0–8) and user-created files (9–255) using typed probes (N, F, B, T, C, R, ST, A, L) to accurately detect only files that exist in the program
@@ -227,6 +229,8 @@ plc-trend-tool/
 
 ### Connecting to a PLC
 
+Each row on the **PLC Connection** view is one controller. Click **+ Add Controller** to add rows (up to 8); give a row an optional **Name** (e.g. `Kiln`) — it's used on the tag-panel tab and as the `[Kiln]` prefix in the chart legend, data table, and CSV headers whenever more than one controller's tags are on the chart. Connect and disconnect rows independently; disconnecting one controller removes only its tags (an active trend keeps running for the others).
+
 1. Open the app — it starts on the **PLC Connection** view
 2. Select the controller type from the dropdown:
    - **ControlLogix** — for any ControlLogix chassis (set the processor slot)
@@ -247,6 +251,7 @@ plc-trend-tool/
 3. Adjust the sample rate from the toolbar dropdown
 4. Click **▶ Start Trend** to begin data collection
 5. Tags can be added or removed while the trend is running — new tags start collecting on the next poll cycle (historical data won't exist for newly added tags)
+6. With several controllers connected, switch tabs at the top of the tag panel to pick tags from each one — all selected tags from every controller trend together on the same chart. Controllers are polled in parallel each sample period; a controller that doesn't answer in time is skipped for that sample (gap in its traces, red tab dot) without slowing the others
 
 ### SLC / MicroLogix Tag Browser
 

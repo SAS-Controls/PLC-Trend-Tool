@@ -27,6 +27,7 @@ import sys
 import time
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from bisect import bisect_left
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta
@@ -250,6 +251,28 @@ SLC_TRENDABLE_FILE_TYPES = {"F", "L"}
 # Integer-word SLC types — 16-bit, expandable to whole word + individual bits
 SLC_INTEGER_WORD_TYPES = {"O", "I", "S", "N"}
 
+# -- Multi-controller --
+CONTROLLER_TYPES = ["ControlLogix", "CompactLogix", "Micro800", "SLC 500 / MicroLogix", "PLC-5"]
+MAX_CONTROLLERS = 8
+# Every trended tag is stored under a key that names its controller:
+# "<controller id>::<tag>".  "::" never appears in Logix tag names or
+# SLC/PLC-5 addresses, so the split is unambiguous.  Keys without the
+# separator come from trend files saved by v1.1.0 and older.
+KEY_SEP = "::"
+
+
+def make_key(cid, tag):
+    """Build the trend key for a tag on a given controller."""
+    return f"{cid}{KEY_SEP}{tag}"
+
+
+def split_key(key):
+    """Return (controller_id, tag). controller_id is None for legacy keys."""
+    if isinstance(key, str) and KEY_SEP in key:
+        cid, tag = key.split(KEY_SEP, 1)
+        return cid, tag
+    return None, key
+
 
 def smart_tag_name(tag, all_tags=None):
     """Return a display-friendly tag name that preserves enough context to be unique.
@@ -314,6 +337,9 @@ def load_settings():
         "last_controller": "ControlLogix", "sample_rate": "1 sec",
         "window_width": 1400, "window_height": 850,
         "max_points": 0, "smart_cursor": True,
+        # List of {"name", "type", "ip", "slot"} — one per connection row.
+        # None means "not saved yet" (migrated from last_ip/last_slot on load).
+        "controllers": None,
     }
     path = get_settings_path()
     if os.path.exists(path):
@@ -625,6 +651,311 @@ class PLCManager:
 
 
 # =========================================================================
+# CONTROLLER SESSION -- one per row on the PLC Connection page
+# =========================================================================
+class ControllerSession:
+    """State for one controller: its connection, its tag tree, and the
+    widgets of its row on the connection page. Each session connects,
+    browses, and disconnects independently of the others."""
+
+    def __init__(self, cid):
+        self.cid = cid                    # stable id string ("1", "2", ...)
+        self.plc = PLCManager()
+        self.state = "disconnected"       # disconnected | connecting | connected
+        self.label = f"PLC {cid}"         # name shown on tabs / legend prefixes
+        self.meta = {}                    # name, ip, slot, type, device (for export)
+        # Tag browser state (lives while connected)
+        self.tree = None
+        self.tree_frame = None
+        self.all_ctrl_tags = []
+        self.all_prog_tags = {}
+        self.udt_defs = {}
+        self.struct_items = {}            # tree item id -> struct metadata (lazy expand)
+        self.search_text = ""
+        self.tag_count_text = ""
+        self.tags_loading = False
+        # Polling state (touched by the sampler threads)
+        self.read_busy = False
+        self.comm_ok = True
+        self.shown_status = None          # last status pushed to the UI
+        # Connection-row widgets
+        self.ui = {}
+
+    @property
+    def connected(self):
+        return self.state == "connected" and self.plc.connected
+
+    @property
+    def is_slc(self):
+        return self.plc.controller_type in SLC_CONTROLLER_TYPES
+
+
+# =========================================================================
+# ANIMATED CONTROLLER TAB BAR
+# =========================================================================
+class ControllerTabBar(tk.Canvas):
+    """Segmented tab bar with one tab per connected controller.
+
+    The selected tab sits on a rounded SAS-blue pill with an orange accent
+    line. Changing tabs slides the pill to the new tab with an ease-out
+    animation, so the active controller is always obvious at a glance.
+    Each tab also carries a status dot (green = OK, blue = loading tags,
+    red = communication error) and the number of tags selected on it."""
+
+    HEIGHT = 34
+    PAD = 3
+    ANIM_MS = 240
+    FRAME_MS = 12
+
+    def __init__(self, master, on_select):
+        super().__init__(master, height=self.HEIGHT, highlightthickness=0, bd=0,
+                         bg=resolve_color(BG_CARD), cursor="hand2")
+        self._on_select = on_select
+        self._tabs = []            # [{"cid", "label", "tip", "status", "count"}]
+        self._active = None
+        self._hover = None
+        self._pill = None          # current pill (x0, x1)
+        self._anim = None          # {"start": (x0,x1), "end": (x0,x1), "t0": float}
+        self._anim_job = None
+        self._pill_id = None
+        self._accent_id = None
+        self._tip_win = None
+        self._tip_job = None
+        self._font = tkfont.Font(family=FONT_FAMILY, size=FONT_SIZE_SMALL)
+        self._font_bold = tkfont.Font(family=FONT_FAMILY, size=FONT_SIZE_SMALL, weight="bold")
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", self._on_leave)
+
+    # -- public API --
+    @property
+    def active(self):
+        return self._active
+
+    def set_tabs(self, tabs, active=None):
+        """Replace the tab list. Animates the pill if the active tab moved."""
+        self._tabs = [dict(t) for t in tabs]
+        cids = [t["cid"] for t in self._tabs]
+        if active in cids:
+            new_active = active
+        elif self._active in cids:
+            new_active = self._active
+        else:
+            new_active = cids[0] if cids else None
+        self._active = new_active
+        self._animate_to_active()
+
+    def select(self, cid, notify=False):
+        if cid == self._active or cid not in [t["cid"] for t in self._tabs]:
+            return
+        self._active = cid
+        self._animate_to_active()
+        if notify and self._on_select:
+            self._on_select(cid)
+
+    def set_status(self, cid, status):
+        for t in self._tabs:
+            if t["cid"] == cid and t.get("status") != status:
+                t["status"] = status
+                self._redraw()
+
+    def set_counts(self, counts):
+        changed = False
+        for t in self._tabs:
+            c = counts.get(t["cid"], 0)
+            if t.get("count", 0) != c:
+                t["count"] = c
+                changed = True
+        if changed:
+            self._redraw()
+
+    def refresh_theme(self):
+        self.configure(bg=resolve_color(BG_CARD))
+        self._redraw()
+
+    # -- geometry --
+    def _tab_box(self, idx):
+        w = max(self.winfo_width(), 1)
+        n = max(len(self._tabs), 1)
+        seg = (w - 2 * self.PAD) / n
+        x0 = self.PAD + idx * seg
+        return x0, x0 + seg
+
+    def _active_box(self):
+        for i, t in enumerate(self._tabs):
+            if t["cid"] == self._active:
+                x0, x1 = self._tab_box(i)
+                return x0 + 2, x1 - 2
+        return None
+
+    def _index_at(self, x):
+        for i in range(len(self._tabs)):
+            x0, x1 = self._tab_box(i)
+            if x0 <= x < x1:
+                return i
+        return None
+
+    @staticmethod
+    def _round_rect(x0, y0, x1, y1, r):
+        r = max(0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+
+    # -- animation --
+    def _animate_to_active(self):
+        target = self._active_box()
+        if self._anim_job:
+            self.after_cancel(self._anim_job)
+            self._anim_job = None
+        if target is None or self._pill is None or self.winfo_width() <= 1:
+            self._pill = target
+            self._anim = None
+            self._redraw()
+            return
+        self._anim = {"start": self._pill, "end": target, "t0": time.monotonic()}
+        self._redraw()
+        self._anim_step()
+
+    def _anim_step(self):
+        a = self._anim
+        if not a:
+            return
+        t = (time.monotonic() - a["t0"]) * 1000.0 / self.ANIM_MS
+        if t >= 1.0:
+            self._pill = a["end"]
+            self._anim = None
+            self._anim_job = None
+            self._redraw()   # pill has landed: switch the label to white-on-blue
+            return
+        else:
+            e = 1 - (1 - t) ** 3   # ease-out cubic
+            (s0, s1), (e0, e1) = a["start"], a["end"]
+            self._pill = (s0 + (e0 - s0) * e, s1 + (e1 - s1) * e)
+            self._anim_job = self.after(self.FRAME_MS, self._anim_step)
+        self._place_pill()
+
+    def _place_pill(self):
+        if self._pill is None or self._pill_id is None:
+            return
+        x0, x1 = self._pill
+        h = self.HEIGHT
+        self.coords(self._pill_id, *self._round_rect(x0, self.PAD + 2, x1, h - self.PAD - 2, 7))
+        self.coords(self._accent_id, x0 + 10, h - self.PAD - 4, x1 - 10, h - self.PAD - 4)
+
+    # -- drawing --
+    def _redraw(self):
+        self.delete("all")
+        self._pill_id = self._accent_id = None
+        w = self.winfo_width()
+        h = self.HEIGHT
+        if w <= 1 or not self._tabs:
+            return
+        if self._anim is None:
+            self._pill = self._active_box()
+        # Track
+        self.create_polygon(self._round_rect(self.PAD, self.PAD, w - self.PAD, h - self.PAD, 8),
+                            smooth=True, fill=resolve_color(BG_INPUT),
+                            outline=resolve_color(BORDER_COLOR))
+        # Hover highlight (non-active tab)
+        for i, t in enumerate(self._tabs):
+            if t["cid"] == self._hover and t["cid"] != self._active:
+                x0, x1 = self._tab_box(i)
+                self.create_polygon(self._round_rect(x0 + 2, self.PAD + 2, x1 - 2, h - self.PAD - 2, 7),
+                                    smooth=True, fill=resolve_color(BG_CARD_HOVER), outline="")
+        # Sliding pill + accent
+        if self._pill is not None:
+            self._pill_id = self.create_polygon(0, 0, 0, 0, 0, 0, smooth=True,
+                                                fill=SAS_BLUE, outline=SAS_BLUE_DARK)
+            self._accent_id = self.create_line(0, 0, 0, 0, fill=SAS_ORANGE, width=2,
+                                               capstyle="round")
+            self._place_pill()
+        # Labels
+        for i, t in enumerate(self._tabs):
+            x0, x1 = self._tab_box(i)
+            is_active = t["cid"] == self._active
+            font = self._font_bold if is_active else self._font
+            if is_active and self._anim is None:
+                color = "#FFFFFF"
+            elif is_active:
+                color = SAS_BLUE_LIGHT   # pill still sliding in underneath
+            elif t["cid"] == self._hover:
+                color = resolve_color(TEXT_PRIMARY)
+            else:
+                color = resolve_color(TEXT_SECONDARY)
+            text = t["label"]
+            count = t.get("count", 0)
+            suffix = f" ({count})" if count else ""
+            dot_w = 12
+            avail = (x1 - x0) - dot_w - 12
+            full = text + suffix
+            if font.measure(full) > avail:
+                # Drop the count first, then truncate the label with an ellipsis
+                full = text
+                while len(full) > 1 and font.measure(full + "…") > avail:
+                    full = full[:-1]
+                if full != text:
+                    full = full + "…"
+            tw = font.measure(full)
+            cx = (x0 + x1) / 2
+            start = cx - (tw + dot_w) / 2
+            cy = h / 2 - 1
+            dot_color = {"ok": STATUS_GOOD, "loading": SAS_BLUE_LIGHT,
+                         "error": STATUS_ERROR}.get(t.get("status"), STATUS_OFFLINE)
+            self.create_oval(start, cy - 3.5, start + 7, cy + 3.5, fill=dot_color,
+                             outline="#FFFFFF" if is_active else dot_color)
+            self.create_text(start + dot_w, cy, text=full, anchor="w", fill=color, font=font)
+
+    # -- events --
+    def _on_click(self, event):
+        i = self._index_at(event.x)
+        if i is not None:
+            self._hide_tip()
+            self.select(self._tabs[i]["cid"], notify=True)
+
+    def _on_motion(self, event):
+        i = self._index_at(event.x)
+        cid = self._tabs[i]["cid"] if i is not None else None
+        if cid != self._hover:
+            self._hover = cid
+            self._redraw()
+            self._hide_tip()
+            if cid is not None:
+                tip = self._tabs[i].get("tip", "")
+                if tip:
+                    self._tip_job = self.after(600, lambda: self._show_tip(tip))
+
+    def _on_leave(self, event):
+        self._hover = None
+        self._hide_tip()
+        self._redraw()
+
+    def _show_tip(self, text):
+        self._hide_tip()
+        try:
+            x = self.winfo_pointerx() + 12
+            y = self.winfo_pointery() + 16
+            tw = tk.Toplevel(self)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            tk.Label(tw, text=text, justify="left", font=(FONT_FAMILY, FONT_SIZE_TINY),
+                     bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_PRIMARY),
+                     relief="solid", bd=1, padx=6, pady=3).pack()
+            self._tip_win = tw
+        except Exception:
+            self._tip_win = None
+
+    def _hide_tip(self):
+        if self._tip_job:
+            self.after_cancel(self._tip_job)
+            self._tip_job = None
+        if self._tip_win is not None:
+            try: self._tip_win.destroy()
+            except Exception: pass
+            self._tip_win = None
+
+
+# =========================================================================
 # TREND DATA MANAGER
 # =========================================================================
 class TrendDataManager:
@@ -697,14 +1028,19 @@ class TrendDataManager:
             self.max_values = {}
             self.live_values = {}
 
-    def export_pytrend(self, filepath, plc_ip, controller_type, slot):
+    def export_pytrend(self, filepath, plc_ip, controller_type, slot,
+                       controllers=None, tag_labels=None):
+        """controllers: {cid: {"name","ip","slot","type","device"}} for every
+        controller referenced by the trend keys; tag_labels: {key: display}."""
         with self._lock:
             export_data = [{"timestamp": pt["timestamp"], "values": pt["values"]} for pt in self.data]
         payload = {
-            "version": "1.0",
+            "version": "1.1",
             "appName": "PLC Trend Tool -- Southern Automation Solutions",
             "metadata": {
                 "plcIP": plc_ip, "controllerType": controller_type, "slot": slot,
+                "controllers": controllers or {},
+                "tagLabels": tag_labels or {},
                 "tags": self.tags, "sampleRate": self.sample_rate,
                 "startTime": self.start_time,
                 "endTime": datetime.now().isoformat(timespec="milliseconds"),
@@ -716,14 +1052,17 @@ class TrendDataManager:
         with open(filepath, "w") as f:
             json.dump(payload, f, indent=2)
 
-    def export_csv(self, filepath):
+    def export_csv(self, filepath, header_labels=None):
+        """header_labels: optional {key: column title} so multi-controller
+        columns read as "[PLC 1] Tag" instead of the internal key."""
         with self._lock:
             data_copy = list(self.data)
         if not data_copy:
             return
+        labels = header_labels or {}
         with open(filepath, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp"] + self.tags)
+            writer.writerow(["Timestamp"] + [labels.get(t, t) for t in self.tags])
             for pt in data_copy:
                 row = [pt["timestamp"]] + [pt["values"].get(t, "") for t in self.tags]
                 writer.writerow(row)
@@ -756,6 +1095,20 @@ class TrendDataManager:
                         if tag not in self.max_values or val > self.max_values[tag]:
                             self.max_values[tag] = val
         return meta
+
+    def rename_tags(self, mapping):
+        """Re-key tags in place (used to map imported controller ids onto
+        live controllers or onto file-only ids)."""
+        if not mapping:
+            return
+        m = lambda k: mapping.get(k, k)
+        with self._lock:
+            self.tags = [m(t) for t in self.tags]
+            for pt in self.data:
+                pt["values"] = {m(k): v for k, v in pt["values"].items()}
+            self.min_values = {m(k): v for k, v in self.min_values.items()}
+            self.max_values = {m(k): v for k, v in self.max_values.items()}
+            self.live_values = {m(k): v for k, v in self.live_values.items()}
 
     @property
     def point_count(self):
@@ -796,18 +1149,21 @@ class PLCTrendTool(ctk.CTk):
         # the taskbar) and iconbitmap (for the title bar / file explorer).
         self._setup_window_icon()
 
-        self.plc = PLCManager()
+        # Controllers: one ControllerSession per row on the connection page.
+        # Each connects independently; connected ones get a tab in the tag panel.
+        self.sessions = {}              # cid -> ControllerSession (dict order = row order)
+        self._next_cid = 1
+        self._active_cid = None         # controller whose tags the tag panel shows
+        self._ctrl_names = {}           # cid -> display label (kept after disconnect)
+        self._ctrl_meta = {}            # cid -> {"name","ip","slot","type","device"}
+        self._suppress_search = False   # guard while swapping search text between tabs
         max_pts = self.settings.get("max_points", 0)
         self.trend = TrendDataManager(max_points=max_pts)
         self.trend_thread = None
         self.chart_update_timer = None
-        self.selected_tags = set()
-        self.tag_data_types = {}
+        self.selected_tags = set()      # trend keys ("<cid>::<tag>")
+        self.tag_data_types = {}        # trend key -> data type
         self.view_mode = "live"
-        self.all_ctrl_tags = []
-        self.all_prog_tags = {}
-        self.udt_defs = {}  # UDT type definitions from pylogix
-        self._struct_items = {}  # tree item id -> struct metadata for lazy expansion
 
         # Smart cursor state
         self._cursor_vline = None
@@ -1041,76 +1397,168 @@ class PLCTrendTool(ctk.CTk):
                      text_color=TEXT_MUTED, anchor="w").pack(fill="x", padx=24, pady=(8, 6))
 
     # == VIEW: PLC CONNECTION ==
+    # Column widths shared by the header row and every controller row so they line up
+    _CONN_COLS = [(0, 34), (1, 136), (2, 194), (3, 164), (4, 62), (5, 124), (6, 36)]
+
     def _create_connect_view(self):
         view = ctk.CTkScrollableFrame(self._main_area, fg_color="transparent",
                                        scrollbar_button_color=BG_MEDIUM, scrollbar_button_hover_color=SAS_BLUE)
         hdr = ctk.CTkFrame(view, fg_color="transparent")
         hdr.pack(fill="x", padx=24, pady=(20, 4))
-        ctk.CTkLabel(hdr, text="\U0001F50C  PLC Connection", font=(FONT_FAMILY, FONT_SIZE_HEADING, "bold"),
+        ctk.CTkLabel(hdr, text="\U0001F50C  PLC Connections", font=(FONT_FAMILY, FONT_SIZE_HEADING, "bold"),
                      text_color=TEXT_PRIMARY, anchor="w").pack(side="left")
-        ctk.CTkLabel(view, text="Connect to an Allen-Bradley controller to browse tags and start trending.\nSupports ControlLogix, CompactLogix, Micro800, SLC 500, MicroLogix, and PLC-5.",
-                     font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_SECONDARY, anchor="w").pack(fill="x", padx=24, pady=(0, 16))
-        self._build_section_header(view, "CONNECTION SETTINGS")
+        ctk.CTkLabel(view, text="Connect to one or more Allen-Bradley controllers. Each controller connects and "
+                                "disconnects on its own, and tags\nfrom every connected controller can be trended "
+                                "together on the same chart. Supports ControlLogix, CompactLogix,\nMicro800, "
+                                "SLC 500, MicroLogix, and PLC-5.",
+                     font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_SECONDARY, anchor="w",
+                     justify="left").pack(fill="x", padx=24, pady=(0, 16))
+        self._build_section_header(view, "CONTROLLERS")
 
         conn_card = ctk.CTkFrame(view, fg_color=BG_CARD, corner_radius=CARD_CORNER_RADIUS, border_width=1, border_color=BORDER_COLOR)
         conn_card.pack(fill="x", padx=24, pady=(0, 16))
         inner = ctk.CTkFrame(conn_card, fg_color="transparent")
         inner.pack(fill="x", padx=CARD_PADDING, pady=CARD_PADDING)
 
-        # Controller type
-        row1 = ctk.CTkFrame(inner, fg_color="transparent")
-        row1.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(row1, text="Controller Type", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
-                     text_color=TEXT_PRIMARY, anchor="w", width=140).pack(side="left")
-        self.controller_type_var = ctk.StringVar(value="ControlLogix")
-        self._controller_menu = ctk.CTkOptionMenu(row1, variable=self.controller_type_var,
-                          values=["ControlLogix", "CompactLogix", "Micro800", "SLC 500 / MicroLogix", "PLC-5"],
-                          font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM, button_color=SAS_BLUE,
-                          button_hover_color=SAS_BLUE_DARK, dropdown_fg_color=BG_MEDIUM, width=220, height=INPUT_HEIGHT,
-                          command=self._on_controller_type_changed)
-        self._controller_menu.pack(side="left", padx=(12, 0))
+        # Column headings
+        head = ctk.CTkFrame(inner, fg_color="transparent")
+        head.pack(fill="x", pady=(0, 6))
+        for col, minsize in self._CONN_COLS:
+            head.grid_columnconfigure(col, minsize=minsize)
+        for col, text in [(1, "Name"), (2, "Controller Type"), (3, "IP Address"), (4, "Slot")]:
+            ctk.CTkLabel(head, text=text, font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
+                         text_color=TEXT_SECONDARY, anchor="w").grid(row=0, column=col, sticky="w", padx=(0, 6))
 
-        # IP Address
-        row2 = ctk.CTkFrame(inner, fg_color="transparent")
-        row2.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(row2, text="IP Address", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
-                     text_color=TEXT_PRIMARY, anchor="w", width=140).pack(side="left")
-        self.ip_entry = ctk.CTkEntry(row2, width=200, height=INPUT_HEIGHT, font=(FONT_FAMILY_MONO, FONT_SIZE_BODY),
-                                      fg_color=BG_INPUT, border_color=BORDER_COLOR, placeholder_text="192.168.1.10")
-        self.ip_entry.pack(side="left", padx=(12, 0))
-        self.ip_entry.bind("<Return>", lambda e: self._connect())
+        self._conn_rows_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self._conn_rows_frame.pack(fill="x")
 
-        # Slot
-        row3 = ctk.CTkFrame(inner, fg_color="transparent")
-        row3.pack(fill="x", pady=(0, 16))
-        ctk.CTkLabel(row3, text="Processor Slot", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
-                     text_color=TEXT_PRIMARY, anchor="w", width=140).pack(side="left")
-        self.slot_entry = ctk.CTkEntry(row3, width=80, height=INPUT_HEIGHT, font=(FONT_FAMILY_MONO, FONT_SIZE_BODY),
-                                        fg_color=BG_INPUT, border_color=BORDER_COLOR)
-        self.slot_entry.insert(0, "0")
-        self.slot_entry.pack(side="left", padx=(12, 0))
-        self._slot_hint_label = ctk.CTkLabel(row3, text="(Usually 0 for CompactLogix/Micro800)", font=(FONT_FAMILY, FONT_SIZE_SMALL),
-                     text_color=TEXT_MUTED)
-        self._slot_hint_label.pack(side="left", padx=(12, 0))
-
-        # Buttons
-        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
-        btn_row.pack(fill="x")
-        self.connect_btn = ctk.CTkButton(btn_row, text="Connect", width=140, height=BUTTON_HEIGHT,
-                                          font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"), fg_color=SAS_BLUE,
-                                          hover_color=SAS_BLUE_DARK, corner_radius=BUTTON_CORNER_RADIUS, command=self._connect)
-        self.connect_btn.pack(side="left")
-        self.conn_status_label = ctk.CTkLabel(btn_row, text="", font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_SECONDARY)
-        self.conn_status_label.pack(side="left", padx=(16, 0))
-
-        # Device info
-        self._build_section_header(view, "DEVICE INFO")
-        self.device_card = ctk.CTkFrame(view, fg_color=BG_CARD, corner_radius=CARD_CORNER_RADIUS, border_width=1, border_color=BORDER_COLOR)
-        self.device_card.pack(fill="x", padx=24, pady=(0, 16))
-        self.device_info_label = ctk.CTkLabel(self.device_card, text="Not connected -- connect to a PLC to see device information.",
-                                               font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_MUTED, anchor="w")
-        self.device_info_label.pack(fill="x", padx=CARD_PADDING, pady=CARD_PADDING)
+        # Footer: add row + hint
+        foot = ctk.CTkFrame(inner, fg_color="transparent")
+        foot.pack(fill="x", pady=(6, 0))
+        self._add_ctrl_btn = ctk.CTkButton(foot, text="+  Add Controller", width=150, height=30,
+                                           font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
+                                           fg_color="transparent", border_width=1, border_color=SAS_BLUE,
+                                           text_color=SAS_BLUE_LIGHT, hover_color=BG_CARD_HOVER,
+                                           corner_radius=BUTTON_CORNER_RADIUS,
+                                           command=lambda: self._add_controller_row(focus=True))
+        self._add_ctrl_btn.pack(side="left")
+        ctk.CTkLabel(foot, text=f"Up to {MAX_CONTROLLERS} controllers.  Slot = processor slot "
+                                "(usually 0 for CompactLogix / Micro800, not used for SLC / MicroLogix / PLC-5).",
+                     font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED,
+                     anchor="w").pack(side="left", padx=(14, 0))
         return view
+
+    # == CONNECTION ROWS ==
+    def _add_controller_row(self, cfg=None, focus=False):
+        """Add one controller row (name, type, IP, slot, connect/disconnect)."""
+        if len(self.sessions) >= MAX_CONTROLLERS:
+            return None
+        cfg = cfg or {}
+        cid = str(self._next_cid)
+        self._next_cid += 1
+        sess = ControllerSession(cid)
+        self.sessions[cid] = sess
+
+        row = ctk.CTkFrame(self._conn_rows_frame, fg_color="transparent")
+        row.pack(fill="x", pady=(0, 10))
+        for col, minsize in self._CONN_COLS:
+            row.grid_columnconfigure(col, minsize=minsize)
+
+        badge = ctk.CTkLabel(row, text=cid, width=26, height=26, corner_radius=13,
+                             fg_color=STATUS_OFFLINE, text_color="#FFFFFF",
+                             font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"))
+        badge.grid(row=0, column=0, sticky="w")
+
+        name_e = ctk.CTkEntry(row, width=128, height=INPUT_HEIGHT, font=(FONT_FAMILY, FONT_SIZE_BODY),
+                              fg_color=BG_INPUT, border_color=BORDER_COLOR,
+                              placeholder_text=f"PLC {cid}")
+        name_e.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        if cfg.get("name"):
+            name_e.insert(0, cfg["name"])
+
+        ctype = cfg.get("type") if cfg.get("type") in CONTROLLER_TYPES else "ControlLogix"
+        type_var = ctk.StringVar(value=ctype)
+        type_menu = ctk.CTkOptionMenu(row, variable=type_var, values=CONTROLLER_TYPES,
+                                      font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM,
+                                      button_color=SAS_BLUE, button_hover_color=SAS_BLUE_DARK,
+                                      dropdown_fg_color=BG_MEDIUM, width=186, height=INPUT_HEIGHT,
+                                      command=lambda v, s=sess: self._on_row_type_changed(s, v))
+        type_menu.grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+        ip_e = ctk.CTkEntry(row, width=156, height=INPUT_HEIGHT, font=(FONT_FAMILY_MONO, FONT_SIZE_BODY),
+                            fg_color=BG_INPUT, border_color=BORDER_COLOR, placeholder_text="192.168.1.10")
+        ip_e.grid(row=0, column=3, sticky="w", padx=(0, 8))
+        if cfg.get("ip"):
+            ip_e.insert(0, cfg["ip"])
+        ip_e.bind("<Return>", lambda e, c=cid: self._toggle_controller(c))
+
+        slot_e = ctk.CTkEntry(row, width=54, height=INPUT_HEIGHT, font=(FONT_FAMILY_MONO, FONT_SIZE_BODY),
+                              fg_color=BG_INPUT, border_color=BORDER_COLOR, justify="center")
+        slot_e.insert(0, str(cfg.get("slot", 0)))
+        slot_e.grid(row=0, column=4, sticky="w", padx=(0, 8))
+        slot_e.bind("<Return>", lambda e, c=cid: self._toggle_controller(c))
+
+        btn = ctk.CTkButton(row, text="Connect", width=116, height=BUTTON_HEIGHT,
+                            font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"), fg_color=SAS_BLUE,
+                            hover_color=SAS_BLUE_DARK, corner_radius=BUTTON_CORNER_RADIUS,
+                            command=lambda c=cid: self._toggle_controller(c))
+        btn.grid(row=0, column=5, sticky="w", padx=(0, 6))
+
+        rm = ctk.CTkButton(row, text="✕", width=30, height=30, font=(FONT_FAMILY, FONT_SIZE_BODY),
+                           fg_color="transparent", text_color=TEXT_MUTED, hover_color=BG_CARD_HOVER,
+                           corner_radius=BUTTON_CORNER_RADIUS,
+                           command=lambda c=cid: self._remove_controller_row(c))
+        rm.grid(row=0, column=6, sticky="w")
+
+        status = ctk.CTkLabel(row, text="Not connected", font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                              text_color=TEXT_MUTED, anchor="w", justify="left")
+        status.grid(row=1, column=1, columnspan=6, sticky="w", pady=(2, 0))
+
+        sess.ui = {"row": row, "badge": badge, "name": name_e, "type_var": type_var,
+                   "type_menu": type_menu, "ip": ip_e, "slot": slot_e, "btn": btn,
+                   "remove": rm, "status": status}
+        self._on_row_type_changed(sess, ctype)
+        self._update_row_controls()
+        if focus:
+            ip_e.focus_set()
+        return sess
+
+    def _remove_controller_row(self, cid):
+        sess = self.sessions.get(cid)
+        if not sess or sess.state != "disconnected" or len(self.sessions) <= 1:
+            return
+        sess.ui["row"].destroy()
+        del self.sessions[cid]
+        self._update_row_controls()
+
+    def _update_row_controls(self):
+        """Enable/disable the add button and per-row remove buttons."""
+        if hasattr(self, "_add_ctrl_btn"):
+            self._add_ctrl_btn.configure(state="normal" if len(self.sessions) < MAX_CONTROLLERS else "disabled")
+        only_one = len(self.sessions) <= 1
+        for s in self.sessions.values():
+            rm = s.ui.get("remove")
+            if rm is not None:
+                rm.configure(state="disabled" if (only_one or s.state != "disconnected") else "normal")
+
+    def _on_row_type_changed(self, sess, value):
+        """Slot is not used by SLC 500 / MicroLogix / PLC-5."""
+        slot_e = sess.ui.get("slot")
+        if slot_e is None or sess.state != "disconnected":
+            return
+        slot_e.configure(state="disabled" if value in SLC_CONTROLLER_TYPES else "normal")
+
+    def _set_row_inputs_state(self, sess, state):
+        ui = sess.ui
+        for key in ("name", "ip", "slot"):
+            ui[key].configure(state=state)
+        ui["type_menu"].configure(state=state)
+        if state == "normal":
+            self._on_row_type_changed(sess, ui["type_var"].get())
+
+    def _set_row_status(self, sess, text, color):
+        if sess.ui.get("status") is not None:
+            sess.ui["status"].configure(text=text, text_color=color)
 
     # == VIEW: TREND ==
     def _create_trend_view(self):
@@ -1235,7 +1683,7 @@ class PLCTrendTool(ctk.CTk):
         self._tag_panel = tk.Frame(self._h_paned, bg=resolve_color(BG_CARD),
                                     highlightbackground=resolve_color(BORDER_COLOR),
                                     highlightthickness=1, bd=0)
-        self._tag_panel.grid_rowconfigure(2, weight=1)
+        self._tag_panel.grid_rowconfigure(3, weight=1)
         self._tag_panel.grid_columnconfigure(0, weight=1)
 
         # Tag panel header
@@ -1249,13 +1697,18 @@ class PLCTrendTool(ctk.CTk):
         refresh_btn = tk.Button(tp_hdr, text="\u21BB", font=(FONT_FAMILY, FONT_SIZE_SMALL),
                                  bg=resolve_color(BG_MEDIUM), fg=resolve_color(TEXT_SECONDARY),
                                  activebackground=resolve_color(BG_CARD_HOVER), bd=0, relief="flat",
-                                 padx=4, command=self._fetch_tags, cursor="hand2")
+                                 padx=4, command=lambda: self._fetch_tags(), cursor="hand2")
         refresh_btn.pack(side="right", padx=(0, 4))
-        self._add_tooltip(refresh_btn, "Refresh tag list from PLC")
+        self._add_tooltip(refresh_btn, "Refresh tag list from the selected controller")
+
+        # Controller tabs — one per connected controller (hidden when none)
+        self._ctrl_tabs = ControllerTabBar(self._tag_panel, on_select=self._on_tab_selected)
+        self._ctrl_tabs.grid(row=1, column=0, sticky="ew", padx=4, pady=(4, 0))
+        self._ctrl_tabs.grid_remove()
 
         # Search + controls row
         tp_search = tk.Frame(self._tag_panel, bg=resolve_color(BG_CARD))
-        tp_search.grid(row=1, column=0, sticky="ew", padx=4, pady=(4, 2))
+        tp_search.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         self.tag_search_var = ctk.StringVar()
         self.tag_search_var.trace_add("write", lambda *_: self._filter_tags())
         self.tag_search = ctk.CTkEntry(tp_search, placeholder_text="Search...", textvariable=self.tag_search_var,
@@ -1274,22 +1727,17 @@ class PLCTrendTool(ctk.CTk):
 
         # Tag tree
         tp_tree_frame = tk.Frame(self._tag_panel, bg=resolve_color(BG_CARD))
-        tp_tree_frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        tp_tree_frame.grid(row=3, column=0, sticky="nsew", padx=4, pady=(0, 4))
         tp_tree_frame.grid_rowconfigure(0, weight=1)
         tp_tree_frame.grid_columnconfigure(0, weight=1)
+        self._tp_tree_frame = tp_tree_frame
 
         self.tree_style = ttk.Style()
         self._apply_treeview_style()
-        self.tag_tree = ttk.Treeview(tp_tree_frame, columns=("type",), show="tree headings", selectmode="none")
-        self.tag_tree.heading("#0", text="Tag Name", anchor="w")
-        self.tag_tree.heading("type", text="Type", anchor="w")
-        self.tag_tree.column("#0", width=220, minwidth=120)
-        self.tag_tree.column("type", width=60, minwidth=40)
-        self.tag_tree.grid(row=0, column=0, sticky="nsew")
-        tree_scroll = ttk.Scrollbar(tp_tree_frame, orient="vertical", command=self.tag_tree.yview)
-        tree_scroll.grid(row=0, column=1, sticky="ns")
-        self.tag_tree.configure(yscrollcommand=tree_scroll.set)
-        self.tag_tree.bind("<ButtonRelease-1>", self._on_tag_click)
+        # Placeholder tree shown while no controller is connected; each
+        # connected controller gets its own tree (see _create_session_tree)
+        self._placeholder_frame, self.tag_tree = self._make_tag_tree(tp_tree_frame)
+        self._placeholder_frame.grid(row=0, column=0, sticky="nsew")
         self._set_tag_placeholder("Connect to a PLC to browse tags")
 
         self._h_paned.add(self._tag_panel, width=300, minsize=200, stretch="never")
@@ -2149,7 +2597,7 @@ class PLCTrendTool(ctk.CTk):
             hdr = ctk.CTkFrame(card, fg_color="transparent")
             hdr.pack(fill="x", padx=10, pady=(8, 4))
 
-            display_name = smart_tag_name(tag, tags_to_edit)
+            display_name = self._tag_label(tag, tags_to_edit)
             ctk.CTkLabel(hdr, text=display_name,
                          font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
                          text_color=TEXT_PRIMARY).pack(side="left")
@@ -2329,7 +2777,7 @@ class PLCTrendTool(ctk.CTk):
                 tag_idx = tags.index(tag) if tag in tags else i
                 lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
-                display_name = smart_tag_name(tag, display_tags)
+                display_name = self._tag_label(tag, display_tags)
                 line, = ax.plot(times, vals, label=display_name,
                                 color=lp["color"], linewidth=lp["width"],
                                 linestyle=lp["style"])
@@ -2353,7 +2801,7 @@ class PLCTrendTool(ctk.CTk):
                 tag_idx = tags.index(tag) if tag in tags else i
                 lp = self._get_line_props(tag, tag_idx)
                 times, vals = chart_data.get(tag, ([], []))
-                display_name = smart_tag_name(tag, display_tags)
+                display_name = self._tag_label(tag, display_tags)
                 line, = self.ax.plot(times, vals, label=display_name,
                                      color=lp["color"], linewidth=lp["width"],
                                      linestyle=lp["style"])
@@ -2610,7 +3058,7 @@ class PLCTrendTool(ctk.CTk):
                 swatch.pack(side="left", padx=(0, 6))
                 swatch.create_rectangle(1, 1, 11, 11, fill=color, outline=color)
 
-                display_name = smart_tag_name(tag, tags)
+                display_name = self._tag_label(tag, tags)
                 ctk.CTkLabel(row1, text=display_name, font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
                              text_color=TEXT_PRIMARY).pack(side="left")
 
@@ -2854,7 +3302,7 @@ class PLCTrendTool(ctk.CTk):
                 disp_idx = ordered_tags.index(tag) if tag in ordered_tags else i
                 lp = self._get_line_props(tag, disp_idx)
                 color = lp["color"]
-                display_name = smart_tag_name(tag, tags_list)
+                display_name = self._tag_label(tag, tags_list)
                 if val is not None and val == val:  # val==val is False for NaN
                     val_str = f"{val:.4f}" if isinstance(val, float) else str(val)
                     # In isolated mode, draw dot on the tag's own axis
@@ -3070,74 +3518,162 @@ class PLCTrendTool(ctk.CTk):
             self._storage_info_label.configure(
                 text=f"Current: {current_pts:,} points  •  Limit: {limit_str}  •  No active trend data")
 
-    # == CONNECTION LOGIC ==
-    def _on_controller_type_changed(self, value):
-        """Update UI hints when controller type dropdown changes."""
-        if value in SLC_CONTROLLER_TYPES:
-            self._slot_hint_label.configure(text="(Not used for SLC/MicroLogix/PLC-5)")
-            self.slot_entry.configure(state="disabled")
-        elif value == "Micro800":
-            self._slot_hint_label.configure(text="(Always 0 for Micro800)")
-            self.slot_entry.configure(state="normal")
-        elif value == "CompactLogix":
-            self._slot_hint_label.configure(text="(Usually 0 for CompactLogix)")
-            self.slot_entry.configure(state="normal")
-        else:
-            self._slot_hint_label.configure(text="(Slot where processor resides)")
-            self.slot_entry.configure(state="normal")
+    # == CONNECTION LOGIC (one controller per row) ==
+    def _connected_sessions(self):
+        return [s for s in self.sessions.values() if s.connected]
 
-    def _connect(self):
-        if self.plc.connected:
-            self._disconnect()
+    def _toggle_controller(self, cid):
+        """Connect/Disconnect button for one row — rows operate independently."""
+        sess = self.sessions.get(cid)
+        if not sess or sess.state == "connecting":
             return
-        ip = self.ip_entry.get().strip()
-        slot = self.slot_entry.get().strip() or "0"
-        ctype = self.controller_type_var.get()
+        if sess.state == "connected":
+            self._disconnect_controller(cid)
+            return
+        ui = sess.ui
+        ip = ui["ip"].get().strip()
+        slot = ui["slot"].get().strip() or "0"
+        ctype = ui["type_var"].get()
         if not ip:
-            self.conn_status_label.configure(text="Enter an IP address.", text_color=STATUS_ERROR)
+            self._set_row_status(sess, "Enter an IP address.", STATUS_ERROR)
             return
-        self.connect_btn.configure(state="disabled", text="Connecting...")
-        self.conn_status_label.configure(text="")
+        try:
+            slot_num = int(slot)
+        except ValueError:
+            self._set_row_status(sess, "Slot must be a number.", STATUS_ERROR)
+            return
+        # Don't open two sessions to the same processor
+        for other in self.sessions.values():
+            if other is sess or other.state == "disconnected":
+                continue
+            same_slot = ctype in SLC_CONTROLLER_TYPES or other.plc.slot == slot_num
+            if other.plc.ip == ip and same_slot:
+                self._set_row_status(sess, f"Already connected as {other.label}.", STATUS_ERROR)
+                return
+        sess.state = "connecting"
+        sess.label = ui["name"].get().strip() or f"PLC {cid}"
+        self._set_row_inputs_state(sess, "disabled")
+        ui["btn"].configure(state="disabled", text="Connecting...")
+        ui["badge"].configure(fg_color=STATUS_WARN)
+        self._set_row_status(sess, f"Connecting to {ip}...", TEXT_SECONDARY)
+        self._update_row_controls()
+
         def do_connect():
-            success, message = self.plc.connect(ip, slot, ctype)
-            self.after(0, lambda: self._on_connect_result(success, message))
+            success, message = sess.plc.connect(ip, slot_num, ctype)
+            self.after(0, lambda: self._on_connect_result(cid, success, message))
         threading.Thread(target=do_connect, daemon=True).start()
 
-    def _on_connect_result(self, success, message):
+    def _on_connect_result(self, cid, success, message):
+        sess = self.sessions.get(cid)
+        if sess is None:
+            return
+        ui = sess.ui
         if success:
-            self.connect_btn.configure(state="normal", text="Disconnect", fg_color=STATUS_ERROR, hover_color="#b91c1c")
-            self.conn_status_label.configure(text="\u2713 Connected", text_color=STATUS_GOOD)
-            if self.plc.controller_type in SLC_CONTROLLER_TYPES:
-                self.device_info_label.configure(
-                    text=f"Device: {message}\nIP: {self.plc.ip}  |  Type: {self.plc.controller_type}",
-                    text_color=TEXT_PRIMARY)
-            else:
-                self.device_info_label.configure(
-                    text=f"Device: {message}\nIP: {self.plc.ip}  |  Slot: {self.plc.slot}  |  Type: {self.plc.controller_type}",
-                    text_color=TEXT_PRIMARY)
-            self._sidebar_status.configure(text=f"\u25CF Connected -- {self.plc.ip}", text_color=STATUS_GOOD)
-            # Pre-fetch tags in background so they're ready when user navigates to trend view
-            self._fetch_tags()
+            sess.state = "connected"
+            sess.comm_ok = True
+            sess.shown_status = None
+            sess.meta = {"name": sess.label, "ip": sess.plc.ip, "slot": sess.plc.slot,
+                         "type": sess.plc.controller_type, "device": message}
+            self._ctrl_names[cid] = sess.label
+            self._ctrl_meta[cid] = dict(sess.meta)
+            ui["btn"].configure(state="normal", text="Disconnect", fg_color=STATUS_ERROR, hover_color="#b91c1c")
+            ui["badge"].configure(fg_color=STATUS_GOOD)
+            self._set_row_status(sess, self._row_connected_text(sess), STATUS_GOOD)
+            self._create_session_tree(sess)
+            self._refresh_tabs(select=cid)
+            self._refresh_sidebar_status()
+            self._update_selected_count()
+            self._save_current_settings()
+            # Pre-fetch tags in background so they're ready on the trend view
+            self._fetch_tags(sess)
         else:
-            self.connect_btn.configure(state="normal", text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
-            self.conn_status_label.configure(text=message, text_color=STATUS_ERROR)
+            sess.state = "disconnected"
+            self._set_row_inputs_state(sess, "normal")
+            ui["btn"].configure(state="normal", text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
+            ui["badge"].configure(fg_color=STATUS_OFFLINE)
+            self._set_row_status(sess, message, STATUS_ERROR)
+        self._update_row_controls()
 
-    def _disconnect(self):
+    def _row_connected_text(self, sess, extra=""):
+        p = sess.plc
+        slot = "" if p.controller_type in SLC_CONTROLLER_TYPES else f"  •  Slot {p.slot}"
+        txt = f"✓ Connected  •  {p.device_name}  •  {p.ip}{slot}  •  {p.controller_type}"
+        if sess.tag_count_text:
+            txt += f"  •  {sess.tag_count_text}"
+        return txt + extra
+
+    def _disconnect_controller(self, cid, confirm=True):
+        """Disconnect one controller. Its tags leave the chart; the other
+        controllers keep running (an active trend continues if any tags remain)."""
+        sess = self.sessions.get(cid)
+        if not sess or sess.state == "disconnected":
+            return
+        keys = [k for k in self.selected_tags if split_key(k)[0] == cid]
+        if confirm and self.trend.trending and keys:
+            if not messagebox.askyesno(
+                    "Disconnect Controller",
+                    f"{sess.label} has {len(keys)} tag(s) in the active trend.\n\n"
+                    f"Disconnecting removes them from the trend. The other controllers keep trending.\n\n"
+                    f"Disconnect {sess.label}?"):
+                return
+        sess.state = "disconnected"
+        remaining = [k for k in self.selected_tags if split_key(k)[0] != cid]
+
+        # Drop this controller's tags from the chart and trend
+        for k in keys:
+            self.selected_tags.discard(k)
+            self._tag_scales.pop(k, None)
+            self._line_props.pop(k, None)
+            self._chart_bg.pop(k, None)
+        self._tag_order = [t for t in self._tag_order if split_key(t)[0] != cid]
+        if self._fullscreen_tag and split_key(self._fullscreen_tag)[0] == cid:
+            self._fullscreen_tag = None
+        if self.trend.trending:
+            if remaining:
+                self.trend.update_tags(remaining)
+            else:
+                self._stop_trend()
+
+        # Close the connection off the UI thread (a read may be holding the lock)
+        threading.Thread(target=sess.plc.disconnect, daemon=True).start()
+
+        # Tear down this controller's tag tree and tab
+        if sess.tree_frame is not None:
+            sess.tree_frame.destroy()
+        sess.tree = sess.tree_frame = None
+        sess.all_ctrl_tags, sess.all_prog_tags, sess.udt_defs, sess.struct_items = [], {}, {}, {}
+        sess.search_text = sess.tag_count_text = ""
+        sess.tags_loading = False
+        sess.shown_status = None
+        for k in [k for k in self.tag_data_types if split_key(k)[0] == cid and k not in self.trend.tags]:
+            del self.tag_data_types[k]
+
+        # Row UI
+        ui = sess.ui
+        self._set_row_inputs_state(sess, "normal")
+        ui["btn"].configure(state="normal", text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
+        ui["badge"].configure(fg_color=STATUS_OFFLINE)
+        self._set_row_status(sess, "Not connected", TEXT_MUTED)
+        self._update_row_controls()
+
+        if not self._connected_sessions() and not any(s.state == "connecting" for s in self.sessions.values()):
+            self._reset_after_all_disconnected()
+        else:
+            self._refresh_tabs()
+            self._update_selected_count()
+            self._rebuild_chart()
+            self._update_live_table()
+        self._refresh_sidebar_status()
+
+    def _reset_after_all_disconnected(self):
+        """Last controller went offline — clear the session (same as the
+        single-PLC disconnect behavior in v1.1.0)."""
         if self.trend.trending:
             self._stop_trend()
         self.trend.clear()
-        self.plc.disconnect()
-        self.connect_btn.configure(text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
-        self.conn_status_label.configure(text="")
-        self.device_info_label.configure(text="Not connected -- connect to a PLC to see device information.", text_color=TEXT_MUTED)
-        self._sidebar_status.configure(text="\u25CF Disconnected", text_color=STATUS_OFFLINE)
+        self._refresh_tabs()
         self._set_tag_placeholder("Connect to a PLC to browse tags")
-        # Clear all session state
         self.selected_tags.clear()
-        self.all_ctrl_tags = []
-        self.all_prog_tags = {}
-        self.udt_defs = {}
-        self._struct_items = {}
         self.tag_data_types.clear()
         self._tag_scales.clear()
         self._line_props.clear()
@@ -3156,85 +3692,221 @@ class PLCTrendTool(ctk.CTk):
         self._rebuild_chart()
         self._update_live_table()
 
-    # == TAG BROWSER LOGIC ==
-    def _set_tag_placeholder(self, text):
-        for item in self.tag_tree.get_children():
-            self.tag_tree.delete(item)
-        self.tag_tree.insert("", "end", text=text, values=("",))
-        self.tag_count_label.configure(text="")
+    def _disconnect_all(self):
+        for cid in list(self.sessions):
+            if self.sessions[cid].state != "disconnected":
+                self._disconnect_controller(cid, confirm=False)
 
-    def _fetch_tags(self):
-        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
-        self._set_tag_placeholder("Scanning data files..." if is_slc else "Loading tags...")
+    def _refresh_sidebar_status(self):
+        conn = self._connected_sessions()
+        if self.trend.trending:
+            n_tags = len(self.trend.tags)
+            cids = {split_key(k)[0] for k in self.trend.tags}
+            n_plc = len([c for c in cids if c in self.sessions]) or len(conn)
+            errs = [s for s in conn if not s.comm_ok]
+            where = conn[0].plc.ip if n_plc == 1 and len(conn) == 1 else f"{n_plc} PLCs"
+            text = f"● Trending -- {n_tags} tags @ {where}"
+            color = SAS_ORANGE
+            if errs:
+                text += f"  ({len(errs)} comm error)"
+                color = STATUS_ERROR
+            self._sidebar_status.configure(text=text, text_color=color)
+        elif conn:
+            where = conn[0].plc.ip if len(conn) == 1 else f"{len(conn)} controllers"
+            self._sidebar_status.configure(text=f"● Connected -- {where}", text_color=STATUS_GOOD)
+        else:
+            self._sidebar_status.configure(text="● Disconnected", text_color=STATUS_OFFLINE)
+
+    def _refresh_comm_status(self):
+        """Push per-controller health (from the sampler) to tabs, rows and sidebar."""
+        changed = False
+        for s in self._connected_sessions():
+            status = "loading" if s.tags_loading else ("ok" if s.comm_ok else "error")
+            if status != s.shown_status:
+                s.shown_status = status
+                changed = True
+                self._ctrl_tabs.set_status(s.cid, status)
+                if status == "error":
+                    self._set_row_status(s, self._row_connected_text(
+                        s, "  •  ⚠ No response on last read"), STATUS_ERROR)
+                elif status == "ok":
+                    self._set_row_status(s, self._row_connected_text(s), STATUS_GOOD)
+        if changed:
+            self._refresh_sidebar_status()
+
+    # == CONTROLLER TABS ==
+    def _active_session(self):
+        s = self.sessions.get(self._active_cid)
+        return s if s is not None and s.connected and s.tree is not None else None
+
+    def _refresh_tabs(self, select=None):
+        """Show one tab per connected controller (none when nothing is connected)."""
+        conn = [s for s in self._connected_sessions() if s.tree is not None]
+        tabs = []
+        for s in conn:
+            m = s.meta
+            slot = "" if m.get("type") in SLC_CONTROLLER_TYPES else f"  Slot {m.get('slot', 0)}"
+            tabs.append({"cid": s.cid, "label": s.label,
+                         "tip": f"{s.label}\n{m.get('device', '')}\n{m.get('ip', '')}{slot}  •  {m.get('type', '')}",
+                         "status": "loading" if s.tags_loading else ("ok" if s.comm_ok else "error"),
+                         "count": sum(1 for k in self.selected_tags if split_key(k)[0] == s.cid)})
+        self._ctrl_tabs.set_tabs(tabs, active=select)
+        if tabs:
+            self._ctrl_tabs.grid()
+        else:
+            self._ctrl_tabs.grid_remove()
+        self._activate_session(self._ctrl_tabs.active)
+
+    def _on_tab_selected(self, cid):
+        self._activate_session(cid)
+
+    def _activate_session(self, cid):
+        """Swap the tag panel to the given controller's tree, search and counts."""
+        self._active_cid = cid
+        sess = self._active_session()
+        # Show only the active tree
+        for s in self.sessions.values():
+            if s.tree_frame is not None and s is not sess:
+                s.tree_frame.grid_remove()
+        if sess is not None:
+            self._placeholder_frame.grid_remove()
+            sess.tree_frame.grid(row=0, column=0, sticky="nsew")
+            text, count = sess.search_text, sess.tag_count_text
+        else:
+            self._placeholder_frame.grid(row=0, column=0, sticky="nsew")
+            text, count = "", ""
+        # Each controller keeps its own search text
+        self._suppress_search = True
+        try:
+            self.tag_search_var.set(text)
+        finally:
+            self._suppress_search = False
+        self.tag_count_label.configure(text=count)
+        self._update_selected_count()
+
+    # == TAG BROWSER LOGIC ==
+    def _make_tag_tree(self, parent):
+        """Create a Tag Name / Type treeview with its scrollbar in a frame."""
+        frame = tk.Frame(parent, bg=resolve_color(BG_CARD))
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+        tree = ttk.Treeview(frame, columns=("type",), show="tree headings", selectmode="none")
+        tree.heading("#0", text="Tag Name", anchor="w")
+        tree.heading("type", text="Type", anchor="w")
+        tree.column("#0", width=220, minwidth=120)
+        tree.column("type", width=60, minwidth=40)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scroll.set)
+        self._configure_tree_tags(tree)
+        return frame, tree
+
+    def _configure_tree_tags(self, tree):
+        tree.tag_configure("group", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"))
+        tree.tag_configure("disabled", foreground=resolve_color(TEXT_MUTED))
+        tree.tag_configure("trendable", foreground=resolve_color(TEXT_PRIMARY))
+        tree.tag_configure("struct", foreground=resolve_color(("#5080B0", "#7AB0D8")))
+
+    def _create_session_tree(self, sess):
+        if sess.tree_frame is not None:
+            sess.tree_frame.destroy()
+        sess.tree_frame, sess.tree = self._make_tag_tree(self._tp_tree_frame)
+        sess.tree.bind("<ButtonRelease-1>", lambda e, s=sess: self._on_tag_click(s, e))
+        sess.tree.bind("<<TreeviewOpen>>", lambda e, s=sess: self._on_tree_expand(s, e))
+        sess.tree.bind("<<TreeviewClose>>", lambda e, s=sess: self._on_tree_collapse(s, e))
+
+    def _set_tag_placeholder(self, text, sess=None):
+        tree = sess.tree if sess is not None else self.tag_tree
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        tree.insert("", "end", text=text, values=("",))
+        if sess is None or sess.cid == self._active_cid:
+            self.tag_count_label.configure(text="")
+
+    def _fetch_tags(self, sess=None):
+        sess = sess or self._active_session()
+        if sess is None or not sess.connected:
+            return
+        is_slc = sess.is_slc
+        sess.tags_loading = True
+        sess.tag_count_text = ""
+        self._ctrl_tabs.set_status(sess.cid, "loading")
+        sess.shown_status = "loading"
+        self._set_tag_placeholder("Scanning data files..." if is_slc else "Loading tags...", sess)
+
         def do_fetch():
-            import time
             time.sleep(0.3)
             # For SLC, pass a progress callback that updates the placeholder text
             progress_cb = None
             if is_slc:
                 def progress_cb(msg):
-                    try: self.after(0, lambda m=msg: self._set_tag_placeholder(m))
+                    try: self.after(0, lambda m=msg: self._set_tag_placeholder(m, sess) if sess.tree else None)
                     except Exception: pass
-            ctrl_tags, prog_tags, udt_defs, error = self.plc.get_tags(progress_callback=progress_cb)
-            if error and self.plc.connected:
+            ctrl_tags, prog_tags, udt_defs, error = sess.plc.get_tags(progress_callback=progress_cb)
+            if error and sess.plc.connected:
                 time.sleep(0.5)
-                ctrl_tags, prog_tags, udt_defs, error = self.plc.get_tags(progress_callback=progress_cb)
-            self.after(0, lambda: self._on_tags_fetched(ctrl_tags, prog_tags, udt_defs, error))
+                ctrl_tags, prog_tags, udt_defs, error = sess.plc.get_tags(progress_callback=progress_cb)
+            self.after(0, lambda: self._on_tags_fetched(sess, ctrl_tags, prog_tags, udt_defs, error))
         threading.Thread(target=do_fetch, daemon=True).start()
 
-    def _on_tags_fetched(self, ctrl_tags, prog_tags, udt_defs, error):
-        for item in self.tag_tree.get_children():
-            self.tag_tree.delete(item)
+    def _on_tags_fetched(self, sess, ctrl_tags, prog_tags, udt_defs, error):
+        if not sess.connected or sess.tree is None:
+            return  # disconnected while loading
+        sess.tags_loading = False
+        tree = sess.tree
+        for item in tree.get_children():
+            tree.delete(item)
         if error:
-            self.tag_tree.insert("", "end", text=f"Error: {error}", values=("",))
+            tree.insert("", "end", text=f"Error: {error}", values=("",))
+            self._refresh_comm_status()
             return
-        self.all_ctrl_tags = ctrl_tags
-        self.all_prog_tags = prog_tags
-        self.udt_defs = udt_defs
-        self.tag_data_types = {}
-        self._struct_items = {}  # map tree item id -> (full_tag_path, dataTypeValue, array_size)
+        sess.all_ctrl_tags = ctrl_tags
+        sess.all_prog_tags = prog_tags
+        sess.udt_defs = udt_defs
+        sess.struct_items = {}  # map tree item id -> (full_tag_path, dataTypeValue, array_size)
+        cid = sess.cid
         total = 0
-        muted = resolve_color(TEXT_MUTED)
-        primary = resolve_color(TEXT_PRIMARY)
-        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
-        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
+        is_slc = sess.is_slc
 
         if is_slc:
             # SLC / MicroLogix / PLC-5 — show scanned data files
             file_count = len(ctrl_tags)
-            gid = self.tag_tree.insert("", "end", text=f"Data Files ({file_count} found)", values=("",), open=True, tags=("group",))
+            gid = tree.insert("", "end", text=f"Data Files ({file_count} found)", values=("",), open=True, tags=("group",))
             for tag in ctrl_tags:
-                self._insert_tag_item(gid, tag, tag["name"])
+                self._insert_tag_item(sess, gid, tag, tag["name"])
                 total += 1
         else:
             # Logix controllers — standard tag list
             if ctrl_tags:
-                gid = self.tag_tree.insert("", "end", text=f"Controller Tags ({len(ctrl_tags)})", values=("",), open=True, tags=("group",))
+                gid = tree.insert("", "end", text=f"Controller Tags ({len(ctrl_tags)})", values=("",), open=True, tags=("group",))
                 for tag in ctrl_tags:
-                    self.tag_data_types[tag["name"]] = tag["dataType"]
-                    self._insert_tag_item(gid, tag, tag["name"])
+                    self.tag_data_types[make_key(cid, tag["name"])] = tag["dataType"]
+                    self._insert_tag_item(sess, gid, tag, tag["name"])
                     total += 1
             for prog_name in sorted(prog_tags.keys()):
                 tags = prog_tags[prog_name]
-                gid = self.tag_tree.insert("", "end", text=f"{prog_name} ({len(tags)})", values=("",), open=False, tags=("group",))
+                gid = tree.insert("", "end", text=f"{prog_name} ({len(tags)})", values=("",), open=False, tags=("group",))
                 for tag in tags:
-                    self.tag_data_types[tag["name"]] = tag["dataType"]
+                    self.tag_data_types[make_key(cid, tag["name"])] = tag["dataType"]
                     dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
-                    self._insert_tag_item(gid, tag, tag["name"], display_name=dn)
+                    self._insert_tag_item(sess, gid, tag, tag["name"], display_name=dn)
                     total += 1
-        self.tag_tree.tag_configure("group", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"))
-        self.tag_tree.tag_configure("disabled", foreground=muted)
-        self.tag_tree.tag_configure("trendable", foreground=primary)
-        self.tag_tree.tag_configure("struct", foreground=struct_fg)
-        label = f"{total} data files" if is_slc else f"{total} tags"
-        self.tag_count_label.configure(text=label)
+        self._configure_tree_tags(tree)
+        sess.tag_count_text = f"{total} data files" if is_slc else f"{total:,} tags"
+        if cid == self._active_cid:
+            self.tag_count_label.configure(text=sess.tag_count_text)
+        sess.shown_status = None  # force the row/tab status to refresh
+        self._refresh_comm_status()
+        if sess.search_text:
+            self._filter_tags(sess)
         self._update_selected_count()
-        # Bind tree expand/collapse for lazy population
-        self.tag_tree.bind("<<TreeviewOpen>>", self._on_tree_expand)
-        self.tag_tree.bind("<<TreeviewClose>>", self._on_tree_collapse)
 
-    def _insert_tag_item(self, parent, tag, full_path, display_name=None):
-        """Insert a tag into the tree. Struct tags get a dummy child for the expand arrow."""
+    def _insert_tag_item(self, sess, parent, tag, full_path, display_name=None):
+        """Insert a tag into a controller's tree. Struct tags get a dummy child for the expand arrow."""
+        tree = sess.tree
         name = display_name or tag["name"]
         is_struct = tag.get("is_struct", 0)
         array_count = tag.get("size", 0) if tag.get("array", 0) else 0
@@ -3247,9 +3919,9 @@ class PLCTrendTool(ctk.CTk):
             sz = tag["size"]
             tn = SLC_FILE_TYPE_NAMES.get(ft, ft)
             display = f"{ft}{fn} — {tn} ({sz} elements)"
-            item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + display,
-                                           values=(ft,), tags=("struct",))
-            self._struct_items[item_id] = {
+            item_id = tree.insert(parent, "end", text="▶ " + display,
+                                  values=(ft,), tags=("struct",))
+            sess.struct_items[item_id] = {
                 "path": f"{ft}{fn}",
                 "dtv": 0,
                 "array": 0,
@@ -3259,24 +3931,24 @@ class PLCTrendTool(ctk.CTk):
                 "_file_num": fn,
                 "_file_size": sz,
             }
-            self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+            tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
         elif is_struct:
             # UDT / struct tag — expandable
-            prefix = "\u25B6 "  # ▶ arrow indicator
+            prefix = "▶ "  # ▶ arrow indicator
             dt_label = tag["dataType"]
             if array_count:
                 dt_label = f"{tag['dataType']}[{array_count}]"
-            item_id = self.tag_tree.insert(parent, "end", text=prefix + name,
-                                           values=(dt_label,), tags=("struct",))
+            item_id = tree.insert(parent, "end", text=prefix + name,
+                                  values=(dt_label,), tags=("struct",))
             # Store metadata for lazy expansion
-            self._struct_items[item_id] = {
+            sess.struct_items[item_id] = {
                 "path": full_path,
                 "dtv": tag.get("dataTypeValue", 0),
                 "array": array_count,
                 "populated": False,
             }
             # Dummy child so the expand arrow appears
-            self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+            tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
         else:
             # Atomic / trendable tag
             is_trendable = tag.get("trendable", False)
@@ -3285,10 +3957,10 @@ class PLCTrendTool(ctk.CTk):
             if array_count and is_trendable and dims == 1:
                 # 1-D array of an atomic type (e.g. INT[60]) — expand to indexed
                 # elements [0]..[n-1]; integer elements can then drill to bits.
-                item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + name,
-                                               values=(f"{tag['dataType']}[{array_count}]",),
-                                               tags=("struct",))
-                self._struct_items[item_id] = {
+                item_id = tree.insert(parent, "end", text="▶ " + name,
+                                      values=(f"{tag['dataType']}[{array_count}]",),
+                                      tags=("struct",))
+                sess.struct_items[item_id] = {
                     "path": full_path,
                     "dtv": tag.get("dataTypeValue", 0),
                     "array": array_count,
@@ -3296,19 +3968,19 @@ class PLCTrendTool(ctk.CTk):
                     "atomic_array": True,
                     "dataType": tag["dataType"],
                 }
-                self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+                tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
             elif array_count and dims > 1:
                 # Multi-dimensional arrays: the tag list only reports the first
                 # dimension, so element addresses can't be built reliably.
-                self.tag_tree.insert(parent, "end",
-                                     text=f"  {name}  (multi-dim array not supported)",
-                                     values=(f"{tag['dataType']}[{array_count},...]",),
-                                     tags=("disabled",))
+                tree.insert(parent, "end",
+                            text=f"  {name}  (multi-dim array not supported)",
+                            values=(f"{tag['dataType']}[{array_count},...]",),
+                            tags=("disabled",))
             elif bit_count > 0:
                 # Integer type — make expandable for bit-level access
-                item_id = self.tag_tree.insert(parent, "end", text="\u25B6 " + name,
-                                               values=(tag["dataType"],), tags=("struct",))
-                self._struct_items[item_id] = {
+                item_id = tree.insert(parent, "end", text="▶ " + name,
+                                      values=(tag["dataType"],), tags=("struct",))
+                sess.struct_items[item_id] = {
                     "path": full_path,
                     "dtv": 0,
                     "array": 0,
@@ -3317,196 +3989,147 @@ class PLCTrendTool(ctk.CTk):
                     "_bit_count": bit_count,
                     "dataType": tag["dataType"],
                 }
-                self.tag_tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
+                tree.insert(item_id, "end", text="Loading...", values=("",), tags=("_dummy",))
             else:
-                prefix = "\u2611 " if full_path in self.selected_tags else "\u2610 "
-                tt = "trendable" if is_trendable else "disabled"
-                self.tag_tree.insert(parent, "end", text=prefix + name,
-                                     values=(tag["dataType"],), tags=(tt, full_path))
+                self._insert_leaf(sess, parent, name, tag["dataType"], full_path,
+                                  trendable=is_trendable)
 
-    def _on_tree_expand(self, event):
+    def _insert_leaf(self, sess, parent, text, data_type, path, trendable=True):
+        """Insert a selectable tag row. The row's ttk tag is the trend key
+        ("<cid>::<path>") so selections never collide across controllers."""
+        key = make_key(sess.cid, path)
+        prefix = "☑ " if key in self.selected_tags else "☐ "
+        sess.tree.insert(parent, "end", text=prefix + text, values=(data_type,),
+                         tags=("trendable" if trendable else "disabled", key))
+        if trendable:
+            self.tag_data_types[key] = data_type
+
+    def _add_lazy_node(self, sess, parent, text, type_label, info):
+        """Insert an expandable node whose children load on first expand."""
+        item = sess.tree.insert(parent, "end", text=f"▶ {text}", values=(type_label,), tags=("struct",))
+        info.setdefault("populated", False)
+        sess.struct_items[item] = info
+        sess.tree.insert(item, "end", text="Loading...", values=("",), tags=("_dummy",))
+        return item
+
+    def _on_tree_expand(self, sess, event):
         """Lazy-load children when a struct/SLC node is expanded."""
-        item = self.tag_tree.focus()
-        if not item or item not in self._struct_items:
+        tree = sess.tree
+        item = tree.focus()
+        if not item or item not in sess.struct_items:
             return
-        info = self._struct_items[item]
+        info = sess.struct_items[item]
         if info["populated"]:
             # Just update arrow
-            ct = self.tag_tree.item(item, "text")
-            if ct.startswith("\u25B6 "):
-                self.tag_tree.item(item, text="\u25BC " + ct[2:])
+            ct = tree.item(item, "text")
+            if ct.startswith("▶ "):
+                tree.item(item, text="▼ " + ct[2:])
             return
         info["populated"] = True
         # Remove dummy child
-        for child in self.tag_tree.get_children(item):
-            if "_dummy" in self.tag_tree.item(child, "tags"):
-                self.tag_tree.delete(child)
-
-        primary = resolve_color(TEXT_PRIMARY)
+        for child in tree.get_children(item):
+            if "_dummy" in tree.item(child, "tags"):
+                tree.delete(child)
 
         # === SLC Data File expansion ===
         if info.get("_slc_file"):
-            self._populate_slc_file(item, info)
+            self._populate_slc_file(sess, item, info)
         # === SLC element with sub-addresses (Timer, Counter, Control, Binary) ===
         elif info.get("_slc_element"):
-            self._populate_slc_element(item, info)
+            self._populate_slc_element(sess, item, info)
         # === Logix bit-addressable element (INT, DINT, etc.) ===
         elif info.get("_bit_addressable"):
-            self._populate_bit_addressable(item, info)
-        # === Logix UDT/struct expansion ===
+            self._populate_bit_addressable(sess, item, info)
         elif info.get("atomic_array"):
             # Array of atomic type — show indexed elements
             dt = info.get("dataType", "UNKNOWN")
             bit_count = BIT_ADDRESSABLE_TYPES.get(dt, 0)
             max_show = min(info["array"], 100)
-            struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
             for i in range(max_show):
                 el_path = f"{info['path']}[{i}]"
                 if bit_count > 0:
                     # Integer type — make expandable so user can drill to bit level
-                    arr_item = self.tag_tree.insert(item, "end", text=f"\u25B6 [{i}]",
-                                                     values=(dt,), tags=("struct",))
-                    self._struct_items[arr_item] = {
-                        "path": el_path,
-                        "dtv": 0,
-                        "array": 0,
-                        "populated": False,
-                        "_bit_addressable": True,
-                        "_bit_count": bit_count,
-                        "dataType": dt,
-                    }
-                    self.tag_tree.insert(arr_item, "end", text="Loading...", values=("",), tags=("_dummy",))
+                    self._add_lazy_node(sess, item, f"[{i}]", dt, {
+                        "path": el_path, "dtv": 0, "array": 0,
+                        "_bit_addressable": True, "_bit_count": bit_count, "dataType": dt,
+                    })
                 else:
                     # BOOL, REAL, LREAL — directly trendable, no bit expansion
-                    prefix = "\u2611 " if el_path in self.selected_tags else "\u2610 "
-                    self.tag_tree.insert(item, "end", text=f"{prefix}[{i}]",
-                                         values=(dt,),
-                                         tags=("trendable", el_path))
-                    self.tag_data_types[el_path] = dt
+                    self._insert_leaf(sess, item, f"[{i}]", dt, el_path)
             if info["array"] > 100:
-                self.tag_tree.insert(item, "end", text=f"... ({info['array'] - 100} more)",
-                                     values=("",), tags=("disabled",))
-            self.tag_tree.tag_configure("trendable", foreground=primary)
-            self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                tree.insert(item, "end", text=f"... ({info['array'] - 100} more)",
+                            values=("",), tags=("disabled",))
         elif info["array"]:
             # Array of structs — create indexed children
             max_show = min(info["array"], 100)
             for i in range(max_show):
-                arr_path = f"{info['path']}[{i}]"
-                arr_item = self.tag_tree.insert(item, "end", text=f"\u25B6 [{i}]",
-                                                values=("",), tags=("struct",))
-                self._struct_items[arr_item] = {
-                    "path": arr_path,
-                    "dtv": info["dtv"],
-                    "array": 0,
-                    "populated": False,
-                }
-                self.tag_tree.insert(arr_item, "end", text="Loading...", values=("",), tags=("_dummy",))
+                self._add_lazy_node(sess, item, f"[{i}]", "", {
+                    "path": f"{info['path']}[{i}]", "dtv": info["dtv"], "array": 0,
+                })
             if info["array"] > 100:
-                self.tag_tree.insert(item, "end", text=f"... ({info['array'] - 100} more elements)",
-                                     values=("",), tags=("disabled",))
+                tree.insert(item, "end", text=f"... ({info['array'] - 100} more elements)",
+                            values=("",), tags=("disabled",))
         else:
-            # Populate UDT members from definition
-            self._populate_udt_members(item, info["path"], info["dtv"])
+            # === Logix UDT/struct expansion — populate members from definition ===
+            self._populate_udt_members(sess, item, info["path"], info["dtv"])
+        self._configure_tree_tags(tree)
         # Update expand arrow text
-        ct = self.tag_tree.item(item, "text")
-        if ct.startswith("\u25B6 "):
-            self.tag_tree.item(item, text="\u25BC " + ct[2:])  # ▼
+        ct = tree.item(item, "text")
+        if ct.startswith("▶ "):
+            tree.item(item, text="▼ " + ct[2:])  # ▼
 
-    def _on_tree_collapse(self, event):
+    def _on_tree_collapse(self, sess, event):
         """Update arrow when a struct node is collapsed."""
-        item = self.tag_tree.focus()
+        tree = sess.tree
+        item = tree.focus()
         if not item:
             return
-        ct = self.tag_tree.item(item, "text")
-        if ct.startswith("\u25BC "):
-            self.tag_tree.item(item, text="\u25B6 " + ct[2:])  # ▶
+        ct = tree.item(item, "text")
+        if ct.startswith("▼ "):
+            tree.item(item, text="▶ " + ct[2:])  # ▶
 
-    def _populate_slc_file(self, parent_item, info):
+    def _populate_slc_file(self, sess, parent_item, info):
         """Populate tree children for an SLC data file (e.g., N7, T4, B3)."""
         ft = info["_file_type"]
         fn = info["_file_num"]
         sz = info["_file_size"]
-        primary = resolve_color(TEXT_PRIMARY)
-        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
         max_show = min(sz, 200)
+        element_nodes = {"T": "Timer", "C": "Counter", "R": "Control", "B": "Binary word"}
 
         for i in range(max_show):
             addr = f"{ft}{fn}:{i}"
             if ft in SLC_TRENDABLE_FILE_TYPES:
                 # Directly trendable only — Float, Long Integer
-                dt_name = "REAL" if ft == "F" else "LINT"
-                prefix = "\u2611 " if addr in self.selected_tags else "\u2610 "
-                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{addr}",
-                                     values=(dt_name,), tags=("trendable", addr))
-                self.tag_data_types[addr] = dt_name
+                self._insert_leaf(sess, parent_item, addr, "REAL" if ft == "F" else "LINT", addr)
             elif ft in SLC_INTEGER_WORD_TYPES:
                 # Integer word — expandable to whole word + individual bits
-                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
-                                             values=("INT",), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": addr, "dtv": 0, "array": 0, "populated": False,
+                self._add_lazy_node(sess, parent_item, addr, "INT", {
+                    "path": addr, "dtv": 0, "array": 0,
                     "_slc_element": True, "_element_type": "INT_WORD",
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-            elif ft == "T":
-                # Timer — expandable to sub-elements
-                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
-                                             values=("Timer",), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": addr, "dtv": 0, "array": 0, "populated": False,
-                    "_slc_element": True, "_element_type": "T",
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-            elif ft == "C":
-                # Counter — expandable to sub-elements
-                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
-                                             values=("Counter",), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": addr, "dtv": 0, "array": 0, "populated": False,
-                    "_slc_element": True, "_element_type": "C",
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-            elif ft == "R":
-                # Control — expandable to sub-elements
-                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
-                                             values=("Control",), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": addr, "dtv": 0, "array": 0, "populated": False,
-                    "_slc_element": True, "_element_type": "R",
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-            elif ft == "B":
-                # Binary — expandable to individual bits
-                child = self.tag_tree.insert(parent_item, "end", text=f"\u25B6 {addr}",
-                                             values=("Binary word",), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": addr, "dtv": 0, "array": 0, "populated": False,
-                    "_slc_element": True, "_element_type": "B",
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
+                })
+            elif ft in element_nodes:
+                # Timer / Counter / Control / Binary — expandable to sub-elements or bits
+                self._add_lazy_node(sess, parent_item, addr, element_nodes[ft], {
+                    "path": addr, "dtv": 0, "array": 0,
+                    "_slc_element": True, "_element_type": ft,
+                })
             elif ft == "ST":
                 # String — not trendable
-                muted = resolve_color(TEXT_MUTED)
-                self.tag_tree.insert(parent_item, "end", text=f"  {addr}",
-                                     values=("STRING",), tags=("disabled",))
+                sess.tree.insert(parent_item, "end", text=f"  {addr}",
+                                 values=("STRING",), tags=("disabled",))
             else:
                 # Unknown type — show as non-trendable
-                muted = resolve_color(TEXT_MUTED)
-                self.tag_tree.insert(parent_item, "end", text=f"  {addr}",
-                                     values=(ft,), tags=("disabled",))
+                sess.tree.insert(parent_item, "end", text=f"  {addr}",
+                                 values=(ft,), tags=("disabled",))
 
         if sz > 200:
-            self.tag_tree.insert(parent_item, "end", text=f"... ({sz - 200} more elements)",
-                                 values=("",), tags=("disabled",))
-        self.tag_tree.tag_configure("trendable", foreground=primary)
-        self.tag_tree.tag_configure("struct", foreground=struct_fg)
+            sess.tree.insert(parent_item, "end", text=f"... ({sz - 200} more elements)",
+                             values=("",), tags=("disabled",))
 
-    def _populate_slc_element(self, parent_item, info):
+    def _populate_slc_element(self, sess, parent_item, info):
         """Populate sub-elements for SLC Timer, Counter, Control, Binary, or Integer word."""
         addr = info["path"]
         etype = info["_element_type"]
-        primary = resolve_color(TEXT_PRIMARY)
 
         if etype == "T":
             subs = SLC_TIMER_SUBS
@@ -3518,27 +4141,14 @@ class PLCTrendTool(ctk.CTk):
             # Binary bits — 16 bits per word
             for bit in range(16):
                 bit_addr = f"{addr}/{bit}"
-                prefix = "\u2611 " if bit_addr in self.selected_tags else "\u2610 "
-                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{bit_addr}",
-                                     values=("BOOL",), tags=("trendable", bit_addr))
-                self.tag_data_types[bit_addr] = "BOOL"
-            self.tag_tree.tag_configure("trendable", foreground=primary)
+                self._insert_leaf(sess, parent_item, bit_addr, "BOOL", bit_addr)
             return
         elif etype == "INT_WORD":
-            # Integer word — whole word as decimal + individual bits
-            # First: trendable whole word
-            prefix = "\u2611 " if addr in self.selected_tags else "\u2610 "
-            self.tag_tree.insert(parent_item, "end", text=f"{prefix}{addr}  (word)",
-                                 values=("INT",), tags=("trendable", addr))
-            self.tag_data_types[addr] = "INT"
-            # Then: 16 individual bits
+            # Integer word — whole word as decimal, then 16 individual bits
+            self._insert_leaf(sess, parent_item, f"{addr}  (word)", "INT", addr)
             for bit in range(16):
                 bit_addr = f"{addr}/{bit}"
-                prefix = "\u2611 " if bit_addr in self.selected_tags else "\u2610 "
-                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{bit_addr}",
-                                     values=("BOOL",), tags=("trendable", bit_addr))
-                self.tag_data_types[bit_addr] = "BOOL"
-            self.tag_tree.tag_configure("trendable", foreground=primary)
+                self._insert_leaf(sess, parent_item, bit_addr, "BOOL", bit_addr)
             return
         else:
             return
@@ -3547,26 +4157,19 @@ class PLCTrendTool(ctk.CTk):
         for suffix, dt, trendable in subs:
             sub_addr = f"{addr}{suffix}"
             if trendable:
-                prefix = "\u2611 " if sub_addr in self.selected_tags else "\u2610 "
-                self.tag_tree.insert(parent_item, "end", text=f"{prefix}{sub_addr}",
-                                     values=(dt,), tags=("trendable", sub_addr))
-                self.tag_data_types[sub_addr] = dt
+                self._insert_leaf(sess, parent_item, sub_addr, dt, sub_addr)
             else:
-                muted = resolve_color(TEXT_MUTED)
-                self.tag_tree.insert(parent_item, "end", text=f"  {sub_addr}",
-                                     values=(dt,), tags=("disabled",))
-        self.tag_tree.tag_configure("trendable", foreground=primary)
+                sess.tree.insert(parent_item, "end", text=f"  {sub_addr}",
+                                 values=(dt,), tags=("disabled",))
 
-    def _populate_bit_addressable(self, parent_item, info):
+    def _populate_bit_addressable(self, sess, parent_item, info):
         """Populate bit-level children for a Logix integer-type tag (INT, DINT, etc.).
         Shows the whole word as trendable, plus individual bits (.0 through .N)."""
         addr = info["path"]
         dt = info.get("dataType", "DINT")
         bit_count = info.get("_bit_count", 32)
-        primary = resolve_color(TEXT_PRIMARY)
 
         # First: trendable whole word
-        prefix = "\u2611 " if addr in self.selected_tags else "\u2610 "
         display = addr.split(".")[-1] if "." in addr else addr
         # Show array index if present
         if "[" in addr:
@@ -3574,29 +4177,19 @@ class PLCTrendTool(ctk.CTk):
             display = f"[{parts[1]}  (whole word)" if len(parts) == 2 else f"{display}  (whole word)"
         else:
             display = f"{display}  (whole word)"
-        self.tag_tree.insert(parent_item, "end", text=f"{prefix}{display}",
-                             values=(dt,), tags=("trendable", addr))
-        self.tag_data_types[addr] = dt
+        self._insert_leaf(sess, parent_item, display, dt, addr)
 
         # Then: individual bits
         for bit in range(bit_count):
-            bit_addr = f"{addr}.{bit}"
-            prefix = "\u2611 " if bit_addr in self.selected_tags else "\u2610 "
-            self.tag_tree.insert(parent_item, "end", text=f"{prefix}.{bit}",
-                                 values=("BOOL",), tags=("trendable", bit_addr))
-            self.tag_data_types[bit_addr] = "BOOL"
-        self.tag_tree.tag_configure("trendable", foreground=primary)
+            self._insert_leaf(sess, parent_item, f".{bit}", "BOOL", f"{addr}.{bit}")
 
-    def _populate_udt_members(self, parent_item, base_path, data_type_value):
+    def _populate_udt_members(self, sess, parent_item, base_path, data_type_value):
         """Populate tree children from UDT definition fields."""
-        udt_def = self.udt_defs.get(data_type_value)
+        udt_def = sess.udt_defs.get(data_type_value)
         if not udt_def:
-            self.tag_tree.insert(parent_item, "end", text="(unable to resolve structure)",
-                                 values=("",), tags=("disabled",))
+            sess.tree.insert(parent_item, "end", text="(unable to resolve structure)",
+                             values=("",), tags=("disabled",))
             return
-        muted = resolve_color(TEXT_MUTED)
-        primary = resolve_color(TEXT_PRIMARY)
-        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
         for field in udt_def["fields"]:
             field_path = f"{base_path}.{field['name']}"
             is_struct = field.get("is_struct", 0)
@@ -3606,157 +4199,174 @@ class PLCTrendTool(ctk.CTk):
                 dt_label = field["dataType"]
                 if array_count:
                     dt_label = f"{field['dataType']}[{array_count}]"
-                child = self.tag_tree.insert(parent_item, "end",
-                                             text=f"\u25B6 {field['name']}",
-                                             values=(dt_label,), tags=("struct",))
-                self._struct_items[child] = {
-                    "path": field_path,
-                    "dtv": field.get("dataTypeValue", 0),
-                    "array": array_count,
-                    "populated": False,
-                }
-                self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-                self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                self._add_lazy_node(sess, parent_item, field["name"], dt_label, {
+                    "path": field_path, "dtv": field.get("dataTypeValue", 0), "array": array_count,
+                })
             else:
                 # Atomic member — check if trendable
                 is_trendable = field["dataType"] in TRENDABLE_TYPES
                 if array_count and is_trendable:
                     # Array of atomic type within UDT — show indexed elements
-                    arr_parent = self.tag_tree.insert(parent_item, "end",
-                                                      text=f"\u25B6 {field['name']}",
-                                                      values=(f"{field['dataType']}[{array_count}]",),
-                                                      tags=("struct",))
-                    self._struct_items[arr_parent] = {
-                        "path": field_path,
-                        "dtv": field.get("dataTypeValue", 0),
-                        "array": array_count,
-                        "populated": False,
-                        "atomic_array": True,  # Flag for atomic array expansion
-                        "dataType": field["dataType"],
-                    }
-                    self.tag_tree.insert(arr_parent, "end", text="Loading...", values=("",), tags=("_dummy",))
-                    self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                    self._add_lazy_node(sess, parent_item, field["name"],
+                                        f"{field['dataType']}[{array_count}]", {
+                        "path": field_path, "dtv": field.get("dataTypeValue", 0),
+                        "array": array_count, "atomic_array": True, "dataType": field["dataType"],
+                    })
                 elif is_trendable:
                     bit_count = BIT_ADDRESSABLE_TYPES.get(field["dataType"], 0)
                     if bit_count > 0:
                         # Integer type — make expandable for bit-level access
-                        child = self.tag_tree.insert(parent_item, "end",
-                                                      text=f"\u25B6 {field['name']}",
-                                                      values=(field["dataType"],),
-                                                      tags=("struct",))
-                        self._struct_items[child] = {
-                            "path": field_path,
-                            "dtv": 0,
-                            "array": 0,
-                            "populated": False,
-                            "_bit_addressable": True,
-                            "_bit_count": bit_count,
+                        self._add_lazy_node(sess, parent_item, field["name"], field["dataType"], {
+                            "path": field_path, "dtv": 0, "array": 0,
+                            "_bit_addressable": True, "_bit_count": bit_count,
                             "dataType": field["dataType"],
-                        }
-                        self.tag_tree.insert(child, "end", text="Loading...", values=("",), tags=("_dummy",))
-                        self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                        })
                     else:
                         # BOOL, REAL, LREAL — directly trendable
-                        prefix = "\u2611 " if field_path in self.selected_tags else "\u2610 "
-                        self.tag_tree.insert(parent_item, "end",
-                                             text=prefix + field["name"],
-                                             values=(field["dataType"],),
-                                             tags=("trendable", field_path))
-                        self.tag_data_types[field_path] = field["dataType"]
-                        self.tag_tree.tag_configure("trendable", foreground=primary)
+                        self._insert_leaf(sess, parent_item, field["name"], field["dataType"], field_path)
                 else:
-                    self.tag_tree.insert(parent_item, "end",
-                                         text=f"  {field['name']}",
-                                         values=(field["dataType"],),
-                                         tags=("disabled",))
-                    self.tag_tree.tag_configure("disabled", foreground=muted)
+                    sess.tree.insert(parent_item, "end", text=f"  {field['name']}",
+                                     values=(field["dataType"],), tags=("disabled",))
 
-    def _on_tag_click(self, event):
-        item = self.tag_tree.identify_row(event.y)
+    @staticmethod
+    def _item_key(item_tags):
+        for t in item_tags:
+            if t not in ("trendable", "disabled", "group", "struct", "_dummy"):
+                return t
+        return None
+
+    def _on_tag_click(self, sess, event):
+        tree = sess.tree
+        item = tree.identify_row(event.y)
         if not item: return
-        item_tags = self.tag_tree.item(item, "tags")
+        item_tags = tree.item(item, "tags")
         if "group" in item_tags or "disabled" in item_tags or "_dummy" in item_tags:
             return
         # Struct items — let Treeview's native expand/collapse handle it
         if "struct" in item_tags:
             return
         # Trendable items — toggle selection
-        tag_name = None
-        for t in item_tags:
-            if t not in ("trendable", "disabled", "group", "struct", "_dummy"):
-                tag_name = t
-                break
-        if not tag_name: return
-        ct = self.tag_tree.item(item, "text")
-        if tag_name in self.selected_tags:
-            self.selected_tags.discard(tag_name)
-            self.tag_tree.item(item, text="\u2610 " + ct[2:])
+        key = self._item_key(item_tags)
+        if not key: return
+        ct = tree.item(item, "text")
+        if key in self.selected_tags:
+            self.selected_tags.discard(key)
+            tree.item(item, text="☐ " + ct[2:])
         else:
-            self.selected_tags.add(tag_name)
-            self.tag_tree.item(item, text="\u2611 " + ct[2:])
+            self.selected_tags.add(key)
+            tree.item(item, text="☑ " + ct[2:])
         self._update_selected_count()
         self._sync_tags_to_chart()
 
-    def _filter_tags(self):
-        query = self.tag_search_var.get().lower().strip()
-        for item in self.tag_tree.get_children(): self.tag_tree.delete(item)
-        self._struct_items = {}
+    def _filter_tags(self, sess=None):
+        if self._suppress_search:
+            return
+        if sess is None:
+            sess = self._active_session()
+            if sess is None:
+                return
+            sess.search_text = self.tag_search_var.get()
+        if sess.tags_loading or (not sess.all_ctrl_tags and not sess.all_prog_tags):
+            return
+        query = sess.search_text.lower().strip()
+        tree = sess.tree
+        for item in tree.get_children(): tree.delete(item)
+        sess.struct_items = {}
         def matches(tag): return not query or query in tag["name"].lower() or query in tag["dataType"].lower()
-        muted = resolve_color(TEXT_MUTED)
-        primary = resolve_color(TEXT_PRIMARY)
-        struct_fg = resolve_color(("#5080B0", "#7AB0D8"))
-        is_slc = self.plc.controller_type in SLC_CONTROLLER_TYPES
-        fc = [t for t in self.all_ctrl_tags if matches(t)]
+        is_slc = sess.is_slc
+        fc = [t for t in sess.all_ctrl_tags if matches(t)]
         if fc:
             label = f"Data Files ({len(fc)})" if is_slc else f"Controller Tags ({len(fc)})"
-            gid = self.tag_tree.insert("", "end", text=label, values=("",), open=True, tags=("group",))
+            gid = tree.insert("", "end", text=label, values=("",), open=True, tags=("group",))
             for tag in fc:
-                self._insert_tag_item(gid, tag, tag["name"])
+                self._insert_tag_item(sess, gid, tag, tag["name"])
         if not is_slc:
-            for pn in sorted(self.all_prog_tags.keys()):
-                fp = [t for t in self.all_prog_tags[pn] if matches(t)]
+            for pn in sorted(sess.all_prog_tags.keys()):
+                fp = [t for t in sess.all_prog_tags[pn] if matches(t)]
                 if fp or (query and query in pn.lower()):
-                    ts = fp if fp else self.all_prog_tags[pn]
-                    gid = self.tag_tree.insert("", "end", text=f"{pn} ({len(ts)})", values=("",), open=bool(query), tags=("group",))
+                    ts = fp if fp else sess.all_prog_tags[pn]
+                    gid = tree.insert("", "end", text=f"{pn} ({len(ts)})", values=("",), open=bool(query), tags=("group",))
                     for tag in ts:
                         dn = tag["name"].split(".")[-1] if "." in tag["name"] else tag["name"]
-                        self._insert_tag_item(gid, tag, tag["name"], display_name=dn)
-        self.tag_tree.tag_configure("group", font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"))
-        self.tag_tree.tag_configure("disabled", foreground=muted)
-        self.tag_tree.tag_configure("trendable", foreground=primary)
-        self.tag_tree.tag_configure("struct", foreground=struct_fg)
+                        self._insert_tag_item(sess, gid, tag, tag["name"], display_name=dn)
+        self._configure_tree_tags(tree)
+
+    def _walk_tree_leaves(self, tree, fn, parent=""):
+        for item in tree.get_children(parent):
+            tags = tree.item(item, "tags")
+            if "trendable" in tags:
+                key = self._item_key(tags)
+                if key:
+                    fn(item, key)
+            self._walk_tree_leaves(tree, fn, item)
 
     def _select_all_visible(self):
-        def walk(parent):
-            for item in self.tag_tree.get_children(parent):
-                tags = self.tag_tree.item(item, "tags")
-                if "trendable" in tags:
-                    for t in tags:
-                        if t not in ("trendable", "disabled", "group", "struct", "_dummy"):
-                            self.selected_tags.add(t)
-                            ct = self.tag_tree.item(item, "text")
-                            if ct.startswith("\u2610 "): self.tag_tree.item(item, text="\u2611 " + ct[2:])
-                            break
-                walk(item)
-        walk("")
+        """Select every trendable row currently shown for the active controller."""
+        sess = self._active_session()
+        if sess is None:
+            return
+        def select(item, key):
+            self.selected_tags.add(key)
+            ct = sess.tree.item(item, "text")
+            if ct.startswith("☐ "): sess.tree.item(item, text="☑ " + ct[2:])
+        self._walk_tree_leaves(sess.tree, select)
         self._update_selected_count()
         self._sync_tags_to_chart()
 
     def _clear_selection(self):
-        self.selected_tags.clear()
-        if self.all_ctrl_tags: self._filter_tags()
+        """Clear the selected tags of the active controller (other tabs keep theirs)."""
+        sess = self._active_session()
+        if sess is None:
+            return
+        for k in [k for k in self.selected_tags if split_key(k)[0] == sess.cid]:
+            self.selected_tags.discard(k)
+        def uncheck(item, key):
+            ct = sess.tree.item(item, "text")
+            if ct.startswith("☑ "): sess.tree.item(item, text="☐ " + ct[2:])
+        self._walk_tree_leaves(sess.tree, uncheck)
         self._update_selected_count()
         self._sync_tags_to_chart()
 
     def _update_selected_count(self):
-        count = len(self.selected_tags)
-        self.selected_label.configure(text=f"{count} selected")
-        self.start_btn.configure(state="normal" if count > 0 and self.plc.connected else "disabled")
+        total = len(self.selected_tags)
+        counts = {}
+        for k in self.selected_tags:
+            cid = split_key(k)[0]
+            counts[cid] = counts.get(cid, 0) + 1
+        active = counts.get(self._active_cid, 0) if self._active_session() else 0
+        if total and total != active:
+            # "this tab / all controllers"
+            self.selected_label.configure(text=f"{active}/{total} sel")
+        else:
+            self.selected_label.configure(text=f"{active} selected")
+        self._ctrl_tabs.set_counts(counts)
+        can_start = total > 0 and bool(self._connected_sessions())
+        self.start_btn.configure(state="normal" if can_start else "disabled")
         # Update tag toggle button with count
-        if count > 0:
-            self._tag_toggle_btn.configure(text=f"\U0001F3F7 Tags ({count})")
+        if total > 0:
+            self._tag_toggle_btn.configure(text=f"\U0001F3F7 Tags ({total})")
         else:
             self._tag_toggle_btn.configure(text="\U0001F3F7 Tags")
+
+    # == TAG LABELS ==
+    def _ctrl_label(self, cid):
+        if cid is None:
+            return ""
+        s = self.sessions.get(cid)
+        if s is not None and s.state != "disconnected":
+            return s.label
+        return self._ctrl_names.get(cid, f"PLC {cid}")
+
+    def _tag_label(self, key, all_keys=None):
+        """Display name for a trend key. When the chart holds tags from more
+        than one controller, the name is prefixed with "[controller] "."""
+        cid, tag = split_key(key)
+        keys = list(all_keys) if all_keys else self._get_ordered_tags()
+        base = smart_tag_name(tag, [split_key(k)[1] for k in keys] if keys else None)
+        cids = {split_key(k)[0] for k in keys} | {cid}
+        if cid is None or len(cids) <= 1:
+            return base
+        return f"[{self._ctrl_label(cid)}] {base}"
 
     def _sync_tags_to_chart(self):
         """Sync selected tags to the chart immediately.
@@ -3775,16 +4385,14 @@ class PLCTrendTool(ctk.CTk):
                 # All tags removed mid-trend — stop trending
                 self._stop_trend()
                 return
-            self._sidebar_status.configure(
-                text=f"\u25CF Trending -- {len(tags)} tags @ {self.plc.ip}",
-                text_color=SAS_ORANGE)
+            self._refresh_sidebar_status()
 
         # Rebuild chart (works with empty data for preview)
         self._rebuild_chart()
 
         # Update UI state
         if tags and not self.trend.trending:
-            self.view_badge_label.configure(text="\u25CF READY", fg=SAS_BLUE)
+            self.view_badge_label.configure(text="● READY", fg=SAS_BLUE)
         elif not tags and not self.trend.trending:
             self.view_badge_label.configure(text="", fg=resolve_color(TEXT_MUTED))
             self.point_label.configure(text="")
@@ -3824,15 +4432,77 @@ class PLCTrendTool(ctk.CTk):
         self.export_csv_btn.configure(state="normal")
         self.clear_data_btn.configure(state="normal")
         self.view_badge_label.configure(text="\u25CF LIVE", fg=STATUS_GOOD)
-        self._sidebar_status.configure(text=f"\u25CF Trending -- {len(tags)} tags @ {self.plc.ip}", text_color=SAS_ORANGE)
+        for s in self.sessions.values():
+            s.comm_ok = True
+        self._refresh_sidebar_status()
         self._show_trend_view()
 
     def _trend_loop(self):
+        """Sample every connected controller in parallel, once per period.
+
+        All controllers' values for a cycle go into ONE data point, so every
+        tag shares the same timestamps (cursor, click-inspect and CSV rows stay
+        aligned). A controller that hasn't answered by the cycle deadline is
+        skipped for that sample (its traces show a gap) instead of stalling
+        the others, and it isn't polled again until its read returns."""
         while self.trend.trending:
-            if self.plc.connected:
-                values = self.plc.read_tags(self.trend.tags)
-                if values: self.trend.add_point(values)
-            time.sleep(self.trend.sample_rate)
+            t0 = time.monotonic()
+            rate = self.trend.sample_rate
+            groups = self._group_keys_by_session(list(self.trend.tags))
+            results = {}
+            lock = threading.Lock()
+            workers = []
+            deadline = t0 + max(rate, 0.25)
+            for sess, pairs in groups:
+                if sess.read_busy:
+                    sess.comm_ok = False  # previous read still outstanding (slow / lost PLC)
+                    continue
+                sess.read_busy = True
+                th = threading.Thread(target=self._read_worker,
+                                      args=(sess, pairs, results, lock, deadline), daemon=True)
+                th.start()
+                workers.append(th)
+            for th in workers:
+                th.join(timeout=max(0.0, deadline - time.monotonic()))
+            with lock:
+                values = {}
+                for part in results.values():
+                    values.update(part)
+            if values and self.trend.trending:
+                self.trend.add_point(values)
+            remaining = rate - (time.monotonic() - t0)
+            if remaining > 0:
+                time.sleep(remaining)
+
+    def _group_keys_by_session(self, keys):
+        """[(session, [(key, raw_tag), ...]), ...] for connected controllers.
+        Legacy keys with no controller id (old trend files) are read from the
+        only connected controller, matching v1.1.0 behavior."""
+        conn = {s.cid: s for s in self.sessions.values() if s.connected}
+        groups = {}
+        for key in keys:
+            cid, raw = split_key(key)
+            if cid is None and len(conn) == 1:
+                cid = next(iter(conn))
+            sess = conn.get(cid)
+            if sess is not None:
+                groups.setdefault(sess.cid, (sess, []))[1].append((key, raw))
+        return list(groups.values())
+
+    def _read_worker(self, sess, pairs, results, lock, deadline):
+        try:
+            vals = sess.plc.read_tags([raw for _, raw in pairs]) or {}
+        except Exception:
+            vals = {}
+        try:
+            mapped = {key: vals.get(raw) for key, raw in pairs if raw in vals}
+            # A reply that misses the sample deadline is dropped, so it counts as a miss
+            on_time = time.monotonic() <= deadline + 0.05
+            sess.comm_ok = on_time and any(v is not None for v in mapped.values())
+            with lock:
+                results[sess.cid] = mapped
+        finally:
+            sess.read_busy = False
 
     def _schedule_chart_update(self, interval_ms):
         if self.chart_update_timer: self.after_cancel(self.chart_update_timer)
@@ -3940,6 +4610,7 @@ class PLCTrendTool(ctk.CTk):
         if hasattr(self, "_storage_info_label"):
             self._update_storage_info()
         if self.trend.trending:
+            self._refresh_comm_status()
             self.chart_update_timer = self.after(interval_ms, lambda: self._update_display(interval_ms))
 
     def _update_scrollbar(self):
@@ -4066,12 +4737,6 @@ class PLCTrendTool(ctk.CTk):
         self._clear_cursor_elements()
         self.view_mode = "live"
 
-        # Clear stored tag lists
-        self.all_ctrl_tags = []
-        self.all_prog_tags = {}
-        self.udt_defs = {}
-        self._struct_items = {}
-
         # Reset toolbar buttons
         self.stop_btn.pack_forget()
         self.pause_btn.pack_forget()
@@ -4091,13 +4756,17 @@ class PLCTrendTool(ctk.CTk):
         self._rebuild_chart()
         self._update_live_table()
 
-        # Reset tag browser and reload if connected
-        if self.plc.connected:
-            self._sidebar_status.configure(text=f"\u25CF Connected -- {self.plc.ip}", text_color=STATUS_GOOD)
-            self._fetch_tags()
+        # Reset every connected controller's tag browser and reload it
+        conn = self._connected_sessions()
+        for s in conn:
+            s.search_text = ""
+            self._fetch_tags(s)
+        if conn:
+            self._activate_session(self._active_cid)
         else:
             self._set_tag_placeholder("Connect to a PLC to browse tags")
-            self._sidebar_status.configure(text="\u25CF Disconnected", text_color=STATUS_OFFLINE)
+        self._update_selected_count()
+        self._refresh_sidebar_status()
 
     def _stop_trend(self):
         self.trend.stop()
@@ -4114,8 +4783,7 @@ class PLCTrendTool(ctk.CTk):
         self._paused = False
         self.start_btn.pack(side="left", padx=(0, 6))
         self.view_badge_label.configure(text="\u25A0 STOPPED", fg=resolve_color(TEXT_MUTED))
-        if self.plc.connected:
-            self._sidebar_status.configure(text=f"\u25CF Connected -- {self.plc.ip}", text_color=STATUS_GOOD)
+        self._refresh_sidebar_status()
         self._update_selected_count()
 
     def _estimate_data_size(self):
@@ -4166,7 +4834,7 @@ class PLCTrendTool(ctk.CTk):
         for item in self.live_tree.get_children(): self.live_tree.delete(item)
 
         def fmt(v):
-            if v is None: return "---"
+            if v is None or (isinstance(v, float) and v != v): return "---"
             if isinstance(v, float): return f"{v:.4f}"
             return str(v)
 
@@ -4179,7 +4847,8 @@ class PLCTrendTool(ctk.CTk):
         else:
             self.live_tree.heading("current", text="Current")
 
-        for tag in self._get_ordered_tags():
+        ordered = self._get_ordered_tags()
+        for tag in ordered:
             dt = self.tag_data_types.get(tag, "---")
             if inspecting:
                 # Look up value at inspected index
@@ -4195,7 +4864,11 @@ class PLCTrendTool(ctk.CTk):
                 val = self.trend.live_values.get(tag)
                 mn = self.trend.min_values.get(tag)
                 mx = self.trend.max_values.get(tag)
-            self.live_tree.insert("", "end", values=(tag, dt, fmt(val), fmt(mn), fmt(mx), "OK" if val is not None else "ERR"))
+            label = split_key(tag)[1]
+            if len({split_key(k)[0] for k in ordered}) > 1:
+                label = f"[{self._ctrl_label(split_key(tag)[0])}] {label}"
+            ok = val is not None and val == val  # NaN (no sample) counts as an error
+            self.live_tree.insert("", "end", values=(label, dt, fmt(val), fmt(mn), fmt(mx), "OK" if ok else "ERR"))
 
     def _clear_data(self):
         self.trend.clear()
@@ -4220,10 +4893,33 @@ class PLCTrendTool(ctk.CTk):
                                            initialfile=f"trend_{ts}.pytrend")
         if not fp: return
         try:
-            self.trend.export_pytrend(fp, self.plc.ip, self.plc.controller_type, self.plc.slot)
+            controllers = self._export_controller_meta()
+            metas = list(controllers.values())
+            # Legacy top-level fields: the controller itself when there's one,
+            # otherwise a comma-joined summary
+            if len(metas) == 1:
+                plc_ip, ctype, slot = metas[0].get("ip", ""), metas[0].get("type", ""), metas[0].get("slot", 0)
+            else:
+                plc_ip = ", ".join(m.get("ip", "") for m in metas)
+                ctype = ", ".join(sorted({m.get("type", "") for m in metas}))
+                slot = None
+            labels = {k: self._tag_label(k, self.trend.tags) for k in self.trend.tags}
+            self.trend.export_pytrend(fp, plc_ip, ctype, slot, controllers=controllers, tag_labels=labels)
             messagebox.showinfo("Export", f"Exported {self.trend.point_count:,} points to:\n{fp}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
+
+    def _export_controller_meta(self):
+        """{cid: meta} for every controller that has tags in the trend."""
+        out = {}
+        for key in self.trend.tags:
+            cid = split_key(key)[0]
+            if cid is None or cid in out:
+                continue
+            meta = dict(self._ctrl_meta.get(cid, {}))
+            meta["name"] = self._ctrl_label(cid)
+            out[cid] = meta
+        return out
 
     def _export_csv(self):
         if self.trend.point_count == 0:
@@ -4234,7 +4930,8 @@ class PLCTrendTool(ctk.CTk):
                                            filetypes=[("CSV Files", "*.csv")], initialfile=f"trend_{ts}.csv")
         if not fp: return
         try:
-            self.trend.export_csv(fp)
+            labels = {k: self._tag_label(k, self.trend.tags) for k in self.trend.tags}
+            self.trend.export_csv(fp, header_labels=labels)
             messagebox.showinfo("Export", f"Exported {self.trend.point_count:,} points to:\n{fp}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
@@ -4246,6 +4943,7 @@ class PLCTrendTool(ctk.CTk):
         try:
             if self.trend.trending: self._stop_trend()
             meta = self.trend.import_pytrend(fp)
+            self._remap_imported_controllers(meta)
             self.view_mode = "historical"
             self._follow_live = False
             # Set selected_tags from imported data so _get_ordered_tags works
@@ -4265,9 +4963,39 @@ class PLCTrendTool(ctk.CTk):
             self._show_trend_view()
             if hasattr(self, "_storage_info_label"):
                 self._update_storage_info()
-            messagebox.showinfo("Import", f"Loaded {meta.get('totalPoints', 0):,} points\nPLC: {meta.get('plcIP', '?')}\nTags: {', '.join(self.trend.tags)}")
+            ctrls = meta.get("controllers") or {}
+            if len(ctrls) > 1:
+                plc_txt = "\n".join(f"  {m.get('name', c)}: {m.get('ip', '?')}" for c, m in ctrls.items())
+                plc_txt = f"Controllers:\n{plc_txt}"
+            else:
+                plc_txt = f"PLC: {meta.get('plcIP', '?')}"
+            tag_txt = ", ".join(self._tag_label(t, self.trend.tags) for t in self.trend.tags)
+            messagebox.showinfo("Import", f"Loaded {meta.get('totalPoints', 0):,} points\n{plc_txt}\nTags: {tag_txt}")
         except Exception as e:
             messagebox.showerror("Import Error", str(e))
+
+    def _remap_imported_controllers(self, meta):
+        """Give imported controller ids a home. A controller in the file that
+        matches a connected one (same IP and slot) maps onto it, so "Start"
+        can resume live trending of the same tags; others become file-only ids
+        ("f1", "f2", ...) so they never collide with live controllers."""
+        ctrls = meta.get("controllers") or {}
+        live = {(s.plc.ip, s.plc.slot if not s.is_slc else None): s.cid
+                for s in self._connected_sessions()}
+        mapping = {}
+        for key in self.trend.tags:
+            cid, raw = split_key(key)
+            if cid is None:
+                continue  # legacy single-PLC file: keys stay as-is
+            m = ctrls.get(cid, {})
+            slot = None if m.get("type") in SLC_CONTROLLER_TYPES else m.get("slot")
+            target = live.get((m.get("ip"), slot))
+            if target is None:
+                target = f"f{cid}"
+                self._ctrl_names[target] = m.get("name") or f"PLC {cid}"
+                self._ctrl_meta[target] = dict(m)
+            mapping[key] = make_key(target, raw)
+        self.trend.rename_tags(mapping)
 
     # == THEME ==
     def _on_theme_selected(self, value):
@@ -4332,27 +5060,46 @@ class PLCTrendTool(ctk.CTk):
                         txt.set_color(text_color)
         try: self.canvas.draw_idle()
         except Exception: pass
-        if self.all_ctrl_tags:
-            self.tag_tree.tag_configure("disabled", foreground=resolve_color(TEXT_MUTED))
-            self.tag_tree.tag_configure("trendable", foreground=resolve_color(TEXT_PRIMARY))
-            self.tag_tree.tag_configure("struct", foreground=resolve_color(("#5080B0", "#7AB0D8")))
+        self._configure_tree_tags(self.tag_tree)
+        for s in self.sessions.values():
+            if s.tree is not None:
+                self._configure_tree_tags(s.tree)
+                s.tree_frame.configure(bg=resolve_color(BG_CARD))
+        if hasattr(self, "_placeholder_frame"):
+            self._placeholder_frame.configure(bg=resolve_color(BG_CARD))
+        if hasattr(self, "_tp_tree_frame"):
+            self._tp_tree_frame.configure(bg=resolve_color(BG_CARD))
+        if hasattr(self, "_ctrl_tabs"):
+            self._ctrl_tabs.refresh_theme()
 
     # == SETTINGS PERSISTENCE ==
     def _restore_settings(self):
-        if self.settings.get("last_ip"): self.ip_entry.insert(0, self.settings["last_ip"])
-        if self.settings.get("last_slot") is not None:
-            self.slot_entry.delete(0, "end")
-            self.slot_entry.insert(0, str(self.settings["last_slot"]))
-        if self.settings.get("last_controller"):
-            self.controller_type_var.set(self.settings["last_controller"])
-            self._on_controller_type_changed(self.settings["last_controller"])
+        rows = self.settings.get("controllers")
+        if not isinstance(rows, list) or not rows:
+            # Migrate the single-PLC settings from v1.1.0
+            rows = [{"name": "", "type": self.settings.get("last_controller", "ControlLogix"),
+                     "ip": self.settings.get("last_ip", ""), "slot": self.settings.get("last_slot", 0)}]
+        for cfg in rows[:MAX_CONTROLLERS]:
+            if isinstance(cfg, dict):
+                self._add_controller_row(cfg)
+        if not self.sessions:
+            self._add_controller_row()
         if self.settings.get("sample_rate"): self.rate_var.set(self.settings["sample_rate"])
 
     def _save_current_settings(self):
-        self.settings["last_ip"] = self.ip_entry.get().strip()
-        try: self.settings["last_slot"] = int(self.slot_entry.get().strip())
-        except ValueError: self.settings["last_slot"] = 0
-        self.settings["last_controller"] = self.controller_type_var.get()
+        rows = []
+        for s in self.sessions.values():
+            ui = s.ui
+            try: slot = int(ui["slot"].get().strip() or 0)
+            except ValueError: slot = 0
+            rows.append({"name": ui["name"].get().strip(), "type": ui["type_var"].get(),
+                         "ip": ui["ip"].get().strip(), "slot": slot})
+        self.settings["controllers"] = rows
+        # Keep the v1.1.0 keys pointing at the first row (harmless if an older build opens the file)
+        if rows:
+            self.settings["last_ip"] = rows[0]["ip"]
+            self.settings["last_slot"] = rows[0]["slot"]
+            self.settings["last_controller"] = rows[0]["type"]
         self.settings["sample_rate"] = self.rate_var.get()
         self.settings["time_span"] = self._time_span_seconds
         self.settings["isolated_mode"] = self._isolated_mode
@@ -4371,8 +5118,10 @@ class PLCTrendTool(ctk.CTk):
             self.trend.stop()
             if self.trend_thread: self.trend_thread.join(timeout=2)
         if self.chart_update_timer: self.after_cancel(self.chart_update_timer)
-        self.plc.disconnect()
         self._save_current_settings()
+        for s in self.sessions.values():
+            try: s.plc.disconnect()
+            except Exception: pass
         self.quit()
         self.destroy()
 
