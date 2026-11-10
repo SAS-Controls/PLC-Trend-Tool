@@ -59,8 +59,8 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - **Logix controllers:** Retrieves full controller and program-scoped tag lists with data types, including UDT and AOI expansion
 - **SLC 500 / MicroLogix / PLC-5:** Automatically scans all 256 data files to discover what exists — no manual address entry needed
   - Probes default files (0–8) and user-created files (9–255) using typed probes (N, F, B, T, C, R, ST, A, L) to accurately detect only files that exist in the program
-  - Integer words (N, O, I, S files) are expandable — trend the whole word as a decimal value or expand to select individual bits (/0 through /15)
-  - Binary words (B files) expand to individual bits (B3:0/0 through B3:0/15)
+  - Integer and Binary words (N, B, O, I, S files) are expandable — trend the whole word as a decimal value or expand to select individual bits (/0 through /15)
+  - **SLC 500 inputs and outputs are shown by rack slot** (`I:3.0`, `O:2.0/5`), the same way RSLogix 500 shows them. The slot layout is read from the processor; if it can't be read, right-click the Input or Output file to enter it
   - Timer, Counter, and Control elements expand to show sub-elements (.ACC, .PRE, .DN, etc.)
   - Float (F) and Long Integer (L) files display directly as trendable values
   - Scan results cached per session — reconnecting to the same PLC is instant
@@ -69,6 +69,12 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - **Tags panel is embedded in the trend view** — select tags and watch the chart update in real time, before or during a trend
 - Collapsible tag panel with resizable splitter to maximize chart area
 - Tags can be added or removed mid-trend without stopping data collection
+
+### Tag Aliases
+- Give any tag a plain-language name — the chart legend, cursor read-out, and data table show the alias instead of the raw address (`Filler Supply Pump Running` instead of `I:3.0/0`)
+- Set an alias by right-clicking a tag in the tag browser, or by double-clicking (or right-clicking) its row in the data table
+- The data table keeps the real address in its own **Address** column, and CSV column titles read `Alias (address)`
+- Aliases are saved per controller (by IP address) and come back the next time you connect; they are also stored in `.pytrend` files
 
 ### Real-Time Trending
 - Background polling thread at configurable sample rates (100 ms to 60 sec)
@@ -257,13 +263,22 @@ Each row on the **PLC Connection** view is one controller. Click **+ Add Control
 
 The tag browser for SLC-type controllers organizes data by file type and number. Each data file appears as an expandable node showing its type and size.
 
-**Integer words (N, O, I, S files)** are expandable with two levels of access:
+**Integer and Binary words (N, B, O, I, S files)** are expandable with two levels of access:
 - Click the expand arrow (▶) to see the word-level checkbox and individual bit checkboxes
 - The first entry (marked "word") trends the whole integer as a decimal number
 - Entries `/0` through `/15` trend individual bits as BOOL values
 - You can trend both the whole word and individual bits simultaneously
 
-**Binary words (B files)** expand to show 16 individual bit checkboxes (`/0` through `/15`).
+**Input and Output files (SLC 500)** are listed by rack slot — `I:3.0`, `I:4.0` — matching RSLogix 500. The tool reads the rack layout from the processor when it scans the data files. If a processor doesn't report its layout, the words appear as `I1:0`, `I1:1` with a "Right-click to set slots" row: right-click the file, choose **I/O Slot Layout...**, and list the slots that hold input (or output) cards, for example `3, 4`, or `1:2, 3, 4:4` when a card uses more than one word. The layout is saved for that controller.
+
+### Tag Aliases
+
+Raw addresses are hard to follow on a trend, so any tag can be given an alias:
+
+1. Right-click the tag in the tag browser and choose **Set Alias...** (or double-click its row in the data table under the chart)
+2. Type a name and press Enter
+
+The alias replaces the address on the chart, legend, cursor read-out, and table. The tag browser shows it beside the address, and the table's **Address** column always shows the real address. To change or remove an alias, right-click the tag again. Aliases are remembered per controller IP address, so they are there the next time you connect to that PLC.
 
 **Timers, Counters, and Controls** expand to show their sub-elements (`.ACC`, `.PRE`, `.DN`, `.EN`, etc.) with trendable numeric values and status bits.
 
@@ -294,7 +309,7 @@ After stopping a trend or importing a `.pytrend` file:
 ### Exporting Data
 
 - Click **`.pytrend`** to save a JSON file with full metadata for later import
-- Click **`CSV`** to save a standard CSV file compatible with Excel or other tools
+- Click **`CSV`** to save a standard CSV file compatible with Excel or other tools (aliased tags get the column title `Alias (address)`)
 - Click **Import** to load a previously saved `.pytrend` file for offline analysis
 
 ---

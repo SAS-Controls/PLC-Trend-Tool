@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PLC Trend Tool v1.1.0
+PLC Trend Tool v1.2.0
 Southern Automation Solutions
 
 A portable desktop trending application for Allen-Bradley PLCs.
@@ -23,6 +23,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 import time
 import threading
@@ -122,6 +123,11 @@ try:
     HAS_PYCOMM3 = True
 except ImportError:
     HAS_PYCOMM3 = False
+try:
+    # Used to read the SLC 500 rack configuration (which slot holds which I/O card)
+    from pycomm3.packets import SendUnitDataRequestPacket
+except Exception:
+    SendUnitDataRequestPacket = None
 
 try:
     import matplotlib
@@ -195,7 +201,7 @@ INPUT_HEIGHT = 36
 # -- Application Info --
 APP_NAME = "PLC Trend Tool"
 APP_FULL_NAME = "PLC Trend Tool"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_COMPANY = "Southern Automation Solutions"
 
 # -- Chart Colors --
@@ -248,8 +254,12 @@ SLC_CONTROL_SUBS = [
 ]
 # Trendable SLC file types (directly readable as numbers, no bit expansion)
 SLC_TRENDABLE_FILE_TYPES = {"F", "L"}
-# Integer-word SLC types — 16-bit, expandable to whole word + individual bits
-SLC_INTEGER_WORD_TYPES = {"O", "I", "S", "N"}
+# Word-based SLC types — 16-bit, expandable to whole word + individual bits.
+# Binary (B) files are included: older programs use B words as integers or
+# compare a whole alarm word, so the word itself must be trendable too.
+SLC_INTEGER_WORD_TYPES = {"O", "I", "S", "N", "B"}
+# Controller type whose I/O image is addressed by rack slot (I:3.0, O:2.0)
+SLC_SLOT_IO_TYPE = "SLC 500 / MicroLogix"
 
 # -- Multi-controller --
 CONTROLLER_TYPES = ["ControlLogix", "CompactLogix", "Micro800", "SLC 500 / MicroLogix", "PLC-5"]
@@ -272,6 +282,68 @@ def split_key(key):
         cid, tag = key.split(KEY_SEP, 1)
         return cid, tag
     return None, key
+
+
+# -- SLC 500 I/O slot addressing --
+# The processor serves the Input and Output files as flat lists of words
+# (I1:0, I1:1, ...), which is what gets read. RSLogix 500 shows the same
+# words by rack slot (I:3.0, I:4.0). A "layout" lists the slots that own
+# words, in slot order:  [(slot, word_count), ...].
+SLC_IO_ADDR_RE = re.compile(r"^([IO])\d*:(\d+)((?:/\d+)?)$", re.IGNORECASE)
+
+
+def parse_slc_io_layout(text):
+    """Parse "3, 4" or "1:2, 3:1, 4:4" into [(slot, words), ...].
+    A bare slot number means one word. Raises ValueError on bad input."""
+    layout = []
+    seen = set()
+    for part in re.split(r"[,;\s]+", (text or "").strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:[:=x](\d+))?", part)
+        if not m:
+            raise ValueError(f'"{part}" is not a slot or slot:words entry')
+        slot, words = int(m.group(1)), int(m.group(2) or 1)
+        if not 0 <= slot <= 30:
+            raise ValueError(f"Slot {slot} is out of range (0-30)")
+        if not 1 <= words <= 255:
+            raise ValueError(f"Slot {slot}: word count must be 1-255")
+        if slot in seen:
+            raise ValueError(f"Slot {slot} is listed twice")
+        seen.add(slot)
+        layout.append((slot, words))
+    if not layout:
+        raise ValueError("Enter at least one slot")
+    layout.sort()
+    return layout
+
+
+def format_slc_io_layout(layout):
+    """[(3, 1), (4, 2)] -> "3:1, 4:2"."""
+    return ", ".join(f"{slot}:{words}" for slot, words in layout or [])
+
+
+def build_slc_io_map(layout):
+    """Flatten a layout into a list indexed by file word: [(slot, word), ...]."""
+    flat = []
+    for slot, words in sorted(layout or []):
+        flat.extend((slot, w) for w in range(words))
+    return flat
+
+
+def slc_io_display_address(address, io_maps):
+    """"I1:0/5" -> "I:3.0/5" using io_maps {"I": [(slot, word), ...], "O": [...]}.
+    Returns None when the address is not an I/O word or its slot is unknown."""
+    m = SLC_IO_ADDR_RE.match(address or "")
+    if not m or not io_maps:
+        return None
+    ft = m.group(1).upper()
+    flat = io_maps.get(ft)
+    idx = int(m.group(2))
+    if not flat or idx >= len(flat):
+        return None
+    slot, word = flat[idx]
+    return f"{ft}:{slot}.{word}{m.group(3)}"
 
 
 def smart_tag_name(tag, all_tags=None):
@@ -340,6 +412,10 @@ def load_settings():
         # List of {"name", "type", "ip", "slot"} — one per connection row.
         # None means "not saved yet" (migrated from last_ip/last_slot on load).
         "controllers": None,
+        # Alias names per controller: {"<ip>" or "<ip>/<slot>": {tag: alias}}
+        "tag_aliases": {},
+        # Manually entered SLC I/O slot layouts: {"<ip>": {"I": "3:1, 4:1", "O": "2:1"}}
+        "slc_io_layouts": {},
     }
     path = get_settings_path()
     if os.path.exists(path):
@@ -372,12 +448,20 @@ class PLCManager:
         self.device_name = ""
         self._lock = threading.Lock()
         self._slc_files = []  # Scanned SLC data file descriptors
+        self._reset_slc_io()
+
+    def _reset_slc_io(self):
+        self.slc_io_auto = {}     # {"I"/"O": [(slot, words), ...]} read from the processor
+        self.slc_io_layouts = {}  # layouts in use (manual entries win over auto)
+        self.slc_io_source = {}   # {"I"/"O": "auto" | "manual"}
+        self.slc_io_maps = {}     # {"I"/"O": [(slot, word), ...]} indexed by file word
 
     def connect(self, ip, slot, controller_type):
         self.ip = ip.strip()
         self.slot = int(slot)
         self.controller_type = controller_type
         self._slc_files = []
+        self._reset_slc_io()
         if not self.ip:
             return False, "IP address is required."
         # SLC 500 / MicroLogix / PLC-5 — use pycomm3 SLCDriver
@@ -439,6 +523,103 @@ class PLCManager:
             self.connected = False
             self.device_name = ""
             self._slc_files = []
+            self._reset_slc_io()
+
+    # -- SLC 500 rack / slot layout --
+    def _slc_pccc_read(self, file_num, file_type, element, sub_element, size):
+        """Raw PCCC protected typed logical read (3 address fields).
+        Returns the reply data bytes, or None on any error."""
+        comm = self.comm
+        if comm is None or SendUnitDataRequestPacket is None:
+            return None
+        try:
+            with self._lock:
+                msg = b"".join((
+                    comm._msg_start(),
+                    b"\x0f", b"\x00",                                # CMD, STS
+                    int(next(comm._sequence)).to_bytes(2, "little"),  # transaction id
+                    b"\xa2",                                         # FNC
+                    bytes((size & 0xFF, file_num & 0xFF, file_type & 0xFF,
+                           element & 0xFF, sub_element & 0xFF)),
+                ))
+                request = SendUnitDataRequestPacket(comm._sequence)
+                request.add(msg)
+                response = comm.send(request)
+            raw = getattr(response, "raw", None)
+            if not raw or len(raw) <= 61 or raw[58] != 0:
+                return None
+            return bytes(raw[61:])
+        except Exception:
+            return None
+
+    def _read_slc_rack_config(self):
+        """Read the rack configuration from the SLC system file (file 0,
+        type 0x60): which slot holds how many input and output words.
+        Returns [(slot, input_words, output_words), ...] or None."""
+        head = self._slc_pccc_read(0, 0x60, 0, 0, 4)
+        if not head:
+            return None
+        slot_count = head[0]            # slots in the rack, processor slot included
+        if not 2 <= slot_count <= 31:   # 0 = no rack (MicroLogix)
+            return None
+        need = 4 + slot_count * 6 + 2
+        data = self._slc_pccc_read(0, 0x60, 0, 0, need)
+        if not data or len(data) < 4 + slot_count * 6:
+            return None
+        slots = []
+        for i in range(slot_count):
+            in_bytes = data[i * 6 + 4] if i * 6 + 4 < len(data) else 0
+            out_bytes = data[i * 6 + 6] if i * 6 + 6 < len(data) else 0
+            slots.append((i, (in_bytes + 1) // 2, (out_bytes + 1) // 2))
+        return slots
+
+    def _detect_slc_io_layout(self):
+        """Work out which rack slot owns each word of the I and O files.
+        A layout is only accepted when its word total matches the size of
+        the file found by the scan, so a misread never mislabels an address."""
+        if self.controller_type != SLC_SLOT_IO_TYPE:
+            return {}
+        sizes = {}
+        for f in self._slc_files:
+            if (f["file_type"], f["file_num"]) in (("I", 1), ("O", 0)):
+                sizes[f["file_type"]] = f["size"]
+        if not sizes:
+            return {}
+        try:
+            rack = self._read_slc_rack_config()
+        except Exception:
+            rack = None
+        found = {}
+        if rack:
+            for ft, col in (("I", 1), ("O", 2)):
+                layout = [(s[0], s[col]) for s in rack if s[col] > 0]
+                if ft in sizes and layout and sum(w for _, w in layout) == sizes[ft]:
+                    found[ft] = layout
+        logger.info(f"SLC I/O layout: rack={rack} sizes={sizes} accepted={found}")
+        return found
+
+    def apply_slc_io_layouts(self, manual=None):
+        """Build the word -> (slot, word) maps. Layouts the user entered by
+        hand win over the ones read from the processor."""
+        self.slc_io_layouts, self.slc_io_source, self.slc_io_maps = {}, {}, {}
+        if self.controller_type != SLC_SLOT_IO_TYPE:
+            return
+        for ft in ("I", "O"):
+            layout, source = (manual or {}).get(ft), "manual"
+            if not layout:
+                layout, source = self.slc_io_auto.get(ft), "auto"
+            if layout:
+                self.slc_io_layouts[ft] = list(layout)
+                self.slc_io_source[ft] = source
+                self.slc_io_maps[ft] = build_slc_io_map(layout)
+
+    def slc_file_size(self, file_type):
+        """Scanned word count of the I or O file (0 if not found)."""
+        want = 1 if file_type == "I" else 0
+        for f in self._slc_files:
+            if f["file_type"] == file_type and f["file_num"] == want:
+                return f["size"]
+        return 0
 
     def _scan_slc_files(self, progress_callback=None):
         """Probe SLC 500 / MicroLogix / PLC-5 data files to discover what exists.
@@ -529,6 +710,9 @@ class PLCManager:
                 self._slc_files = self._scan_slc_files(progress_callback)
                 if not self._slc_files:
                     return [], {}, {}, "No data files found (scan returned empty)"
+                if progress_callback:
+                    progress_callback("Reading I/O slot layout...")
+                self.slc_io_auto = self._detect_slc_io_layout()
                 # Convert scanned files into tag-like entries for the tree
                 controller_tags = []
                 for df in self._slc_files:
@@ -671,6 +855,7 @@ class ControllerSession:
         self.all_prog_tags = {}
         self.udt_defs = {}
         self.struct_items = {}            # tree item id -> struct metadata (lazy expand)
+        self.leaf_text = {}               # tree item id -> row text without checkbox/alias
         self.search_text = ""
         self.tag_count_text = ""
         self.tags_loading = False
@@ -1029,18 +1214,21 @@ class TrendDataManager:
             self.live_values = {}
 
     def export_pytrend(self, filepath, plc_ip, controller_type, slot,
-                       controllers=None, tag_labels=None):
+                       controllers=None, tag_labels=None, aliases=None, addresses=None):
         """controllers: {cid: {"name","ip","slot","type","device"}} for every
-        controller referenced by the trend keys; tag_labels: {key: display}."""
+        controller referenced by the trend keys; tag_labels: {key: display};
+        aliases: {key: alias}; addresses: {key: slot-style SLC I/O address}."""
         with self._lock:
             export_data = [{"timestamp": pt["timestamp"], "values": pt["values"]} for pt in self.data]
         payload = {
-            "version": "1.1",
+            "version": "1.2",
             "appName": "PLC Trend Tool -- Southern Automation Solutions",
             "metadata": {
                 "plcIP": plc_ip, "controllerType": controller_type, "slot": slot,
                 "controllers": controllers or {},
                 "tagLabels": tag_labels or {},
+                "aliases": aliases or {},
+                "addresses": addresses or {},
                 "tags": self.tags, "sampleRate": self.sample_rate,
                 "startTime": self.start_time,
                 "endTime": datetime.now().isoformat(timespec="milliseconds"),
@@ -1163,6 +1351,9 @@ class PLCTrendTool(ctk.CTk):
         self.chart_update_timer = None
         self.selected_tags = set()      # trend keys ("<cid>::<tag>")
         self.tag_data_types = {}        # trend key -> data type
+        self._aliases = {}              # trend key -> alias shown instead of the address
+        self._addr_labels = {}          # trend key -> slot-style address from an imported file
+        self._table_keys = []           # trend key of each live-table row, top to bottom
         self.view_mode = "live"
 
         # Smart cursor state
@@ -1914,16 +2105,20 @@ class PLCTrendTool(ctk.CTk):
                                  highlightthickness=1, bd=0)
         self._table_wrapper = table_wrapper
 
-        columns = ("tag", "type", "current", "min", "max", "status")
+        columns = ("tag", "address", "type", "current", "min", "max", "status")
         self.live_tree = ttk.Treeview(table_wrapper, columns=columns, show="headings", height=6)
-        for col, txt, w, anc in [("tag","Tag Name",200,"w"),("type","Type",80,"w"),("current","Current",130,"e"),
-                                  ("min","Min",130,"e"),("max","Max",130,"e"),("status","Status",70,"center")]:
+        for col, txt, w, anc in [("tag","Tag Name",220,"w"),("address","Address",150,"w"),("type","Type",70,"w"),
+                                  ("current","Current",120,"e"),("min","Min",120,"e"),("max","Max",120,"e"),
+                                  ("status","Status",70,"center")]:
             self.live_tree.heading(col, text=txt, anchor="w" if anc == "w" else anc)
             self.live_tree.column(col, width=w, minwidth=50, anchor=anc)
         self.live_tree.pack(side="left", fill="both", expand=True, padx=4, pady=4)
         live_scroll = ttk.Scrollbar(table_wrapper, orient="vertical", command=self.live_tree.yview)
         live_scroll.pack(side="right", fill="y", pady=4)
         self.live_tree.configure(yscrollcommand=live_scroll.set)
+        # Double-click or right-click a row to give the tag an alias
+        self.live_tree.bind("<Double-1>", self._on_table_double_click)
+        self.live_tree.bind("<Button-3>", self._on_table_right_click)
 
         self._paned.add(table_wrapper, stretch="never", minsize=80)
 
@@ -2159,9 +2354,11 @@ class PLCTrendTool(ctk.CTk):
         # "Line Properties..." — context-aware
         if self._isolated_mode and clicked_ax_idx is not None and clicked_ax_idx < len(tags):
             clicked_tag = tags[clicked_ax_idx]
-            short = clicked_tag.split(".")[-1] if "." in clicked_tag else clicked_tag
+            short = self._tag_label(clicked_tag, tags)
             menu.add_command(label=f"\u270E  Line Properties ({short})...",
                              command=lambda t=clicked_tag: self._show_line_properties([t]))
+            menu.add_command(label=f"\U0001F3F7  Set Alias ({short})...",
+                             command=lambda t=clicked_tag: self._prompt_alias(t))
         elif tags:
             menu.add_command(label="\u270E  Line Properties...",
                              command=lambda: self._show_line_properties(list(tags)))
@@ -2703,7 +2900,7 @@ class PLCTrendTool(ctk.CTk):
                     self.lines[tag].set_color(color)
                     self.lines[tag].set_linewidth(w)
                     self.lines[tag].set_linestyle(style)
-                    self.lines[tag].set_label(tag)
+                    self.lines[tag].set_label(self._tag_label(tag))
                 # Apply background color
                 bg_val = edits["bg_var"].get()
                 if bg_val and bg_val != default_bg:
@@ -3576,6 +3773,7 @@ class PLCTrendTool(ctk.CTk):
                          "type": sess.plc.controller_type, "device": message}
             self._ctrl_names[cid] = sess.label
             self._ctrl_meta[cid] = dict(sess.meta)
+            self._load_aliases(sess)
             ui["btn"].configure(state="normal", text="Disconnect", fg_color=STATUS_ERROR, hover_color="#b91c1c")
             ui["badge"].configure(fg_color=STATUS_GOOD)
             self._set_row_status(sess, self._row_connected_text(sess), STATUS_GOOD)
@@ -3642,9 +3840,14 @@ class PLCTrendTool(ctk.CTk):
             sess.tree_frame.destroy()
         sess.tree = sess.tree_frame = None
         sess.all_ctrl_tags, sess.all_prog_tags, sess.udt_defs, sess.struct_items = [], {}, {}, {}
+        sess.leaf_text = {}
         sess.search_text = sess.tag_count_text = ""
         sess.tags_loading = False
         sess.shown_status = None
+        # Aliases stay saved in the settings file; only this session's copies go
+        for d in (self._aliases, self._addr_labels):
+            for k in [k for k in d if split_key(k)[0] == cid]:
+                del d[k]
         for k in [k for k in self.tag_data_types if split_key(k)[0] == cid and k not in self.trend.tags]:
             del self.tag_data_types[k]
 
@@ -3675,6 +3878,8 @@ class PLCTrendTool(ctk.CTk):
         self._set_tag_placeholder("Connect to a PLC to browse tags")
         self.selected_tags.clear()
         self.tag_data_types.clear()
+        self._aliases.clear()
+        self._addr_labels.clear()
         self._tag_scales.clear()
         self._line_props.clear()
         self._chart_bg.clear()
@@ -3813,6 +4018,7 @@ class PLCTrendTool(ctk.CTk):
             sess.tree_frame.destroy()
         sess.tree_frame, sess.tree = self._make_tag_tree(self._tp_tree_frame)
         sess.tree.bind("<ButtonRelease-1>", lambda e, s=sess: self._on_tag_click(s, e))
+        sess.tree.bind("<Button-3>", lambda e, s=sess: self._on_tree_right_click(s, e))
         sess.tree.bind("<<TreeviewOpen>>", lambda e, s=sess: self._on_tree_expand(s, e))
         sess.tree.bind("<<TreeviewClose>>", lambda e, s=sess: self._on_tree_collapse(s, e))
 
@@ -3867,9 +4073,12 @@ class PLCTrendTool(ctk.CTk):
         sess.all_prog_tags = prog_tags
         sess.udt_defs = udt_defs
         sess.struct_items = {}  # map tree item id -> (full_tag_path, dataTypeValue, array_size)
+        sess.leaf_text = {}
         cid = sess.cid
         total = 0
         is_slc = sess.is_slc
+        if is_slc:
+            self._apply_io_layout(sess)
 
         if is_slc:
             # SLC / MicroLogix / PLC-5 — show scanned data files
@@ -3999,8 +4208,10 @@ class PLCTrendTool(ctk.CTk):
         ("<cid>::<path>") so selections never collide across controllers."""
         key = make_key(sess.cid, path)
         prefix = "☑ " if key in self.selected_tags else "☐ "
-        sess.tree.insert(parent, "end", text=prefix + text, values=(data_type,),
-                         tags=("trendable" if trendable else "disabled", key))
+        item = sess.tree.insert(parent, "end", text=prefix + text + self._alias_suffix(key),
+                                values=(data_type,),
+                                tags=("trendable" if trendable else "disabled", key))
+        sess.leaf_text[item] = text
         if trendable:
             self.tag_data_types[key] = data_type
 
@@ -4094,21 +4305,33 @@ class PLCTrendTool(ctk.CTk):
         fn = info["_file_num"]
         sz = info["_file_size"]
         max_show = min(sz, 200)
-        element_nodes = {"T": "Timer", "C": "Counter", "R": "Control", "B": "Binary word"}
+        element_nodes = {"T": "Timer", "C": "Counter", "R": "Control"}
+        io_maps = sess.plc.slc_io_maps
+        slot_io = (ft in ("I", "O") and (ft, fn) in (("I", 1), ("O", 0))
+                   and sess.plc.controller_type == SLC_SLOT_IO_TYPE)
+        if slot_io and len(io_maps.get(ft, [])) < sz:
+            # Rack layout unknown (or covers only part of the file): the words
+            # below can't be named by slot until the layout is entered
+            sess.tree.insert(parent_item, "end",
+                             text="  Right-click to set slots",
+                             values=("",), tags=("disabled",))
 
         for i in range(max_show):
             addr = f"{ft}{fn}:{i}"
+            # I/O words read as I1:0, I1:1 ... but are shown the way RSLogix
+            # shows them (I:3.0, I:4.0) once the slot layout is known
+            label = (slc_io_display_address(addr, io_maps) if slot_io else None) or addr
             if ft in SLC_TRENDABLE_FILE_TYPES:
                 # Directly trendable only — Float, Long Integer
                 self._insert_leaf(sess, parent_item, addr, "REAL" if ft == "F" else "LINT", addr)
             elif ft in SLC_INTEGER_WORD_TYPES:
-                # Integer word — expandable to whole word + individual bits
-                self._add_lazy_node(sess, parent_item, addr, "INT", {
-                    "path": addr, "dtv": 0, "array": 0,
+                # Integer / binary / I/O word — expandable to whole word + individual bits
+                self._add_lazy_node(sess, parent_item, label, "Binary word" if ft == "B" else "INT", {
+                    "path": addr, "label": label, "dtv": 0, "array": 0,
                     "_slc_element": True, "_element_type": "INT_WORD",
                 })
             elif ft in element_nodes:
-                # Timer / Counter / Control / Binary — expandable to sub-elements or bits
+                # Timer / Counter / Control — expandable to sub-elements
                 self._add_lazy_node(sess, parent_item, addr, element_nodes[ft], {
                     "path": addr, "dtv": 0, "array": 0,
                     "_slc_element": True, "_element_type": ft,
@@ -4137,18 +4360,13 @@ class PLCTrendTool(ctk.CTk):
             subs = SLC_COUNTER_SUBS
         elif etype == "R":
             subs = SLC_CONTROL_SUBS
-        elif etype == "B":
-            # Binary bits — 16 bits per word
-            for bit in range(16):
-                bit_addr = f"{addr}/{bit}"
-                self._insert_leaf(sess, parent_item, bit_addr, "BOOL", bit_addr)
-            return
         elif etype == "INT_WORD":
-            # Integer word — whole word as decimal, then 16 individual bits
-            self._insert_leaf(sess, parent_item, f"{addr}  (word)", "INT", addr)
+            # Integer, binary or I/O word — whole word as decimal, then 16 bits.
+            # "label" is the address as displayed (I:3.0); "addr" is what is read (I1:0).
+            label = info.get("label", addr)
+            self._insert_leaf(sess, parent_item, f"{label}  (word)", "INT", addr)
             for bit in range(16):
-                bit_addr = f"{addr}/{bit}"
-                self._insert_leaf(sess, parent_item, bit_addr, "BOOL", bit_addr)
+                self._insert_leaf(sess, parent_item, f"{label}/{bit}", "BOOL", f"{addr}/{bit}")
             return
         else:
             return
@@ -4272,6 +4490,7 @@ class PLCTrendTool(ctk.CTk):
         tree = sess.tree
         for item in tree.get_children(): tree.delete(item)
         sess.struct_items = {}
+        sess.leaf_text = {}
         def matches(tag): return not query or query in tag["name"].lower() or query in tag["dataType"].lower()
         is_slc = sess.is_slc
         fc = [t for t in sess.all_ctrl_tags if matches(t)]
@@ -4357,16 +4576,358 @@ class PLCTrendTool(ctk.CTk):
             return s.label
         return self._ctrl_names.get(cid, f"PLC {cid}")
 
+    def _address_label(self, key):
+        """The tag's address as it should be read by a person. SLC I/O words
+        are read as I1:0 / O0:2 but shown by rack slot (I:3.0 / O:2.0)."""
+        cid, tag = split_key(key)
+        sess = self.sessions.get(cid)
+        if sess is not None and sess.plc.slc_io_maps:
+            label = slc_io_display_address(tag, sess.plc.slc_io_maps)
+            if label:
+                return label
+        return self._addr_labels.get(key, tag)
+
     def _tag_label(self, key, all_keys=None):
-        """Display name for a trend key. When the chart holds tags from more
-        than one controller, the name is prefixed with "[controller] "."""
+        """Display name for a trend key: its alias if it has one, otherwise
+        its address. When the chart holds tags from more than one controller,
+        the name is prefixed with "[controller] "."""
         cid, tag = split_key(key)
         keys = list(all_keys) if all_keys else self._get_ordered_tags()
-        base = smart_tag_name(tag, [split_key(k)[1] for k in keys] if keys else None)
+        base = self._aliases.get(key)
+        if not base:
+            addr = self._address_label(key)
+            if len(addr) > 40 and keys:
+                base = smart_tag_name(addr, [self._address_label(k) for k in keys])
+            else:
+                base = smart_tag_name(addr)
         cids = {split_key(k)[0] for k in keys} | {cid}
         if cid is None or len(cids) <= 1:
             return base
         return f"[{self._ctrl_label(cid)}] {base}"
+
+    # == TAG ALIASES ==
+    ALIAS_SEP = "   —  "
+
+    def _alias_suffix(self, key):
+        alias = self._aliases.get(key)
+        return f"{self.ALIAS_SEP}{alias}" if alias else ""
+
+    @staticmethod
+    def _store_id(sess):
+        """Settings key for a controller: its IP, plus the slot for Logix."""
+        p = sess.plc
+        return p.ip if p.controller_type in SLC_CONTROLLER_TYPES else f"{p.ip}/{p.slot}"
+
+    def _load_aliases(self, sess):
+        """Bring a controller's saved aliases into the session on connect."""
+        for k in [k for k in self._aliases if split_key(k)[0] == sess.cid]:
+            del self._aliases[k]
+        saved = (self.settings.get("tag_aliases") or {}).get(self._store_id(sess)) or {}
+        for tag, alias in saved.items():
+            if isinstance(alias, str) and alias.strip():
+                self._aliases[make_key(sess.cid, tag)] = alias.strip()
+
+    def _set_alias(self, key, alias):
+        """Set (or clear, when blank) the alias of a tag and refresh every
+        place its name is shown. Aliases of connected controllers are saved."""
+        alias = " ".join((alias or "").split())[:60]
+        if alias:
+            self._aliases[key] = alias
+        else:
+            self._aliases.pop(key, None)
+        cid, tag = split_key(key)
+        sess = self.sessions.get(cid)
+        if sess is not None and sess.state == "connected":
+            store = self.settings.get("tag_aliases")
+            if not isinstance(store, dict):
+                store = self.settings["tag_aliases"] = {}
+            sid = self._store_id(sess)
+            entry = store.setdefault(sid, {})
+            if alias:
+                entry[tag] = alias
+            else:
+                entry.pop(tag, None)
+            if not entry:
+                store.pop(sid, None)
+            save_settings(self.settings)
+        self._refresh_leaf_text(key)
+        self._rebuild_chart()
+        self._update_live_table()
+
+    def _refresh_leaf_text(self, key=None, sess=None):
+        """Re-draw tree rows so they show the current alias (one key, or all)."""
+        sessions = [sess] if sess is not None else list(self.sessions.values())
+        if key is not None:
+            sessions = [s for s in sessions if s.cid == split_key(key)[0]]
+        for s in sessions:
+            if s.tree is None:
+                continue
+            def update(item, k, s=s):
+                base = s.leaf_text.get(item)
+                if base is None or (key is not None and k != key):
+                    return
+                current = s.tree.item(item, "text")
+                s.tree.item(item, text=current[:2] + base + self._alias_suffix(k))
+            self._walk_tree_leaves(s.tree, update)
+
+    def _prompt_alias(self, key):
+        """Dialog to name a tag. The alias replaces the address on the chart,
+        legend, cursor read-out and table; the address stays visible beside it."""
+        cid, _ = split_key(key)
+        addr = self._address_label(key)
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Tag Alias")
+        dlg.geometry(self._centered_geometry(440, 230))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.configure(fg_color=BG_DARK)
+
+        ctk.CTkLabel(dlg, text="Tag Alias", font=(FONT_FAMILY, 14, "bold"),
+                     text_color=TEXT_PRIMARY).pack(padx=16, pady=(14, 2), anchor="w")
+        where = f"{addr}   •   {self._ctrl_label(cid)}" if cid is not None else addr
+        ctk.CTkLabel(dlg, text=where, font=(FONT_FAMILY, FONT_SIZE_BODY),
+                     text_color=SAS_BLUE_LIGHT).pack(padx=16, anchor="w")
+
+        var = ctk.StringVar(value=self._aliases.get(key, ""))
+        entry = ctk.CTkEntry(dlg, textvariable=var, font=(FONT_FAMILY, FONT_SIZE_BODY),
+                             fg_color=BG_INPUT, border_color=BORDER_COLOR, height=INPUT_HEIGHT,
+                             placeholder_text="e.g. Filler Supply Pump Running")
+        entry.pack(fill="x", padx=16, pady=(12, 4))
+        ctk.CTkLabel(dlg, text="The trend shows this name instead of the address. Leave blank to remove it.",
+                     font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED,
+                     anchor="w").pack(fill="x", padx=16)
+
+        def save(value=None):
+            self._set_alias(key, var.get() if value is None else value)
+            dlg.destroy()
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(16, 14), side="bottom")
+        ctk.CTkButton(btn_row, text="Save", width=100, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
+                      fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK,
+                      command=save).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="Remove Alias", width=120, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM,
+                      hover_color=BG_CARD_HOVER, text_color=TEXT_SECONDARY,
+                      command=lambda: save("")).pack(side="left")
+        ctk.CTkButton(btn_row, text="Cancel", width=90, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM,
+                      hover_color=BG_CARD_HOVER, text_color=TEXT_SECONDARY,
+                      command=dlg.destroy).pack(side="right")
+        entry.bind("<Return>", lambda e: save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        def focus():
+            try:
+                dlg.grab_set()
+                entry.focus_set()
+                entry.select_range(0, "end")
+            except Exception:
+                pass
+        dlg.after(150, focus)
+        return dlg
+
+    def _centered_geometry(self, width, height):
+        """Geometry string that centers a dialog over the main window."""
+        try:
+            x = self.winfo_rootx() + max((self.winfo_width() - width) // 2, 0)
+            y = self.winfo_rooty() + max((self.winfo_height() - height) // 3, 0)
+            return f"{width}x{height}+{x}+{y}"
+        except Exception:
+            return f"{width}x{height}"
+
+    def _popup_menu(self, widget, actions, event):
+        """Show a context menu built from [(label, callback), ...]."""
+        if not actions:
+            return
+        menu = tk.Menu(widget, tearoff=0,
+                       bg=resolve_color(BG_CARD), fg=resolve_color(TEXT_PRIMARY),
+                       activebackground=SAS_BLUE, activeforeground="#FFFFFF",
+                       font=(FONT_FAMILY, FONT_SIZE_SMALL))
+        for label, callback in actions:
+            if label is None:
+                menu.add_separator()
+            else:
+                menu.add_command(label=label, command=callback)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _alias_actions(self, key):
+        actions = [("\U0001F3F7  Set Alias..." if key not in self._aliases else "\U0001F3F7  Edit Alias...",
+                    lambda: self._prompt_alias(key))]
+        if key in self._aliases:
+            actions.append(("\u2715  Remove Alias", lambda: self._set_alias(key, "")))
+        return actions
+
+    def _io_file_of_item(self, sess, item):
+        """"I" or "O" when the tree row is (or sits inside) the Input or
+        Output file of a slot-addressed SLC; otherwise None."""
+        if sess.plc.controller_type != SLC_SLOT_IO_TYPE:
+            return None
+        while item:
+            info = sess.struct_items.get(item)
+            if info and info.get("_slc_file"):
+                pair = (info["_file_type"], info["_file_num"])
+                return pair[0] if pair in (("I", 1), ("O", 0)) else None
+            item = sess.tree.parent(item)
+        return None
+
+    def _tree_actions(self, sess, item):
+        """Context-menu entries for a row of a controller's tag tree."""
+        actions = []
+        item_tags = sess.tree.item(item, "tags")
+        if "trendable" in item_tags:
+            key = self._item_key(item_tags)
+            if key:
+                actions += self._alias_actions(key)
+        ft = self._io_file_of_item(sess, item)
+        if ft:
+            if actions:
+                actions.append((None, None))
+            actions.append(("\u2630  I/O Slot Layout...",
+                            lambda: self._show_io_layout_dialog(sess, ft)))
+        return actions
+
+    def _on_tree_right_click(self, sess, event):
+        item = sess.tree.identify_row(event.y)
+        if item:
+            self._popup_menu(sess.tree, self._tree_actions(sess, item), event)
+
+    def _table_key_at(self, event):
+        row = self.live_tree.identify_row(event.y)
+        if not row:
+            return None
+        idx = self.live_tree.index(row)
+        return self._table_keys[idx] if 0 <= idx < len(self._table_keys) else None
+
+    def _on_table_double_click(self, event):
+        key = self._table_key_at(event)
+        if key:
+            self._prompt_alias(key)
+
+    def _on_table_right_click(self, event):
+        key = self._table_key_at(event)
+        if key:
+            self._popup_menu(self.live_tree, self._alias_actions(key), event)
+
+    # == SLC I/O SLOT LAYOUT ==
+    def _apply_io_layout(self, sess):
+        """Combine the layout read from the processor with any layout the
+        user entered for this controller, and build the address maps."""
+        manual = {}
+        saved = (self.settings.get("slc_io_layouts") or {}).get(self._store_id(sess)) or {}
+        for ft in ("I", "O"):
+            try:
+                if saved.get(ft):
+                    manual[ft] = parse_slc_io_layout(saved[ft])
+            except ValueError:
+                pass
+        sess.plc.apply_slc_io_layouts(manual)
+
+    def _set_io_layout(self, sess, ft, text):
+        """Save a hand-entered slot layout for the I or O file (blank text
+        returns to the layout read from the processor) and relabel everything."""
+        store = self.settings.get("slc_io_layouts")
+        if not isinstance(store, dict):
+            store = self.settings["slc_io_layouts"] = {}
+        sid = self._store_id(sess)
+        entry = store.setdefault(sid, {})
+        if text:
+            entry[ft] = format_slc_io_layout(parse_slc_io_layout(text))
+        else:
+            entry.pop(ft, None)
+        if not entry:
+            store.pop(sid, None)
+        save_settings(self.settings)
+        self._apply_io_layout(sess)
+        if sess.tree is not None and not sess.tags_loading:
+            self._filter_tags(sess)  # rebuild the tree with the new addresses
+        self._rebuild_chart()
+        self._update_live_table()
+
+    def _show_io_layout_dialog(self, sess, ft):
+        """Dialog to tell the tool which rack slots hold the input (or output)
+        cards, for processors whose rack layout can't be read automatically."""
+        plc = sess.plc
+        name = "Input" if ft == "I" else "Output"
+        size = plc.slc_file_size(ft)
+        auto = plc.slc_io_auto.get(ft)
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("I/O Slot Layout")
+        dlg.geometry(self._centered_geometry(520, 300))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.configure(fg_color=BG_DARK)
+
+        ctk.CTkLabel(dlg, text=f"{name} Slot Layout  •  {sess.label}", font=(FONT_FAMILY, 14, "bold"),
+                     text_color=TEXT_PRIMARY).pack(padx=16, pady=(14, 4), anchor="w")
+        ctk.CTkLabel(dlg, justify="left", anchor="w", wraplength=484,
+                     font=(FONT_FAMILY, FONT_SIZE_BODY), text_color=TEXT_SECONDARY,
+                     text=f"The {name.lower()} file holds {size} word{'s' if size != 1 else ''}. "
+                          f"List the rack slots that have {name.lower()} cards, in order. "
+                          "Add :words for a card with more than one word (32-point and analog cards)."
+                     ).pack(fill="x", padx=16)
+        ctk.CTkLabel(dlg, text="Examples:   3, 4      or      1:2, 3, 4:4", anchor="w",
+                     font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED).pack(fill="x", padx=16, pady=(4, 0))
+
+        var = ctk.StringVar(value=format_slc_io_layout(plc.slc_io_layouts.get(ft)))
+        entry = ctk.CTkEntry(dlg, textvariable=var, font=(FONT_FAMILY, FONT_SIZE_BODY),
+                             fg_color=BG_INPUT, border_color=BORDER_COLOR, height=INPUT_HEIGHT,
+                             placeholder_text="slot, slot:words, ...")
+        entry.pack(fill="x", padx=16, pady=(10, 4))
+        auto_txt = (f"Read from the processor:  {format_slc_io_layout(auto)}" if auto
+                    else "The rack layout could not be read from this processor.")
+        ctk.CTkLabel(dlg, text=auto_txt, anchor="w", font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                     text_color=TEXT_MUTED).pack(fill="x", padx=16)
+        msg = ctk.CTkLabel(dlg, text="", anchor="w", justify="left", wraplength=484,
+                           font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=STATUS_ERROR)
+        msg.pack(fill="x", padx=16, pady=(6, 0))
+
+        def save():
+            try:
+                layout = parse_slc_io_layout(var.get())
+            except ValueError as e:
+                msg.configure(text=str(e))
+                return
+            total = sum(w for _, w in layout)
+            if size and total > size:
+                msg.configure(text=f"That is {total} words, but the {name.lower()} file only has {size}.")
+                return
+            self._set_io_layout(sess, ft, var.get())
+            dlg.destroy()
+
+        def use_auto():
+            self._set_io_layout(sess, ft, "")
+            dlg.destroy()
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(12, 14), side="bottom")
+        ctk.CTkButton(btn_row, text="Save", width=100, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY, "bold"),
+                      fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK,
+                      command=save).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="Use Processor Layout" if auto else "Clear", width=160, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM,
+                      hover_color=BG_CARD_HOVER, text_color=TEXT_SECONDARY,
+                      command=use_auto).pack(side="left")
+        ctk.CTkButton(btn_row, text="Cancel", width=90, height=32,
+                      font=(FONT_FAMILY, FONT_SIZE_BODY), fg_color=BG_MEDIUM,
+                      hover_color=BG_CARD_HOVER, text_color=TEXT_SECONDARY,
+                      command=dlg.destroy).pack(side="right")
+        entry.bind("<Return>", lambda e: save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        def focus():
+            try:
+                dlg.grab_set()
+                entry.focus_set()
+            except Exception:
+                pass
+        dlg.after(150, focus)
+        return dlg
 
     def _sync_tags_to_chart(self):
         """Sync selected tags to the chart immediately.
@@ -4720,12 +5281,16 @@ class PLCTrendTool(ctk.CTk):
                 self.after_cancel(self.chart_update_timer)
                 self.chart_update_timer = None
 
-        # Clear trend data
+        # Clear trend data (and the tag list an imported file may have left behind)
         self.trend.clear()
+        self.trend.update_tags([])
 
         # Clear all tag selections and chart state
         self.selected_tags.clear()
         self.tag_data_types.clear()
+        live_cids = {s.cid for s in self._connected_sessions()}
+        self._aliases = {k: v for k, v in self._aliases.items() if split_key(k)[0] in live_cids}
+        self._addr_labels.clear()
         self._tag_scales.clear()
         self._line_props.clear()
         self._chart_bg.clear()
@@ -4848,6 +5413,8 @@ class PLCTrendTool(ctk.CTk):
             self.live_tree.heading("current", text="Current")
 
         ordered = self._get_ordered_tags()
+        self._table_keys = list(ordered)
+        multi = len({split_key(k)[0] for k in ordered}) > 1
         for tag in ordered:
             dt = self.tag_data_types.get(tag, "---")
             if inspecting:
@@ -4864,11 +5431,13 @@ class PLCTrendTool(ctk.CTk):
                 val = self.trend.live_values.get(tag)
                 mn = self.trend.min_values.get(tag)
                 mx = self.trend.max_values.get(tag)
-            label = split_key(tag)[1]
-            if len({split_key(k)[0] for k in ordered}) > 1:
+            addr = self._address_label(tag)
+            label = self._aliases.get(tag) or addr
+            if multi:
                 label = f"[{self._ctrl_label(split_key(tag)[0])}] {label}"
             ok = val is not None and val == val  # NaN (no sample) counts as an error
-            self.live_tree.insert("", "end", values=(label, dt, fmt(val), fmt(mn), fmt(mx), "OK" if ok else "ERR"))
+            self.live_tree.insert("", "end", values=(label, addr, dt, fmt(val), fmt(mn), fmt(mx),
+                                                     "OK" if ok else "ERR"))
 
     def _clear_data(self):
         self.trend.clear()
@@ -4904,7 +5473,11 @@ class PLCTrendTool(ctk.CTk):
                 ctype = ", ".join(sorted({m.get("type", "") for m in metas}))
                 slot = None
             labels = {k: self._tag_label(k, self.trend.tags) for k in self.trend.tags}
-            self.trend.export_pytrend(fp, plc_ip, ctype, slot, controllers=controllers, tag_labels=labels)
+            aliases = {k: self._aliases[k] for k in self.trend.tags if k in self._aliases}
+            addresses = {k: self._address_label(k) for k in self.trend.tags
+                         if self._address_label(k) != split_key(k)[1]}
+            self.trend.export_pytrend(fp, plc_ip, ctype, slot, controllers=controllers, tag_labels=labels,
+                                      aliases=aliases, addresses=addresses)
             messagebox.showinfo("Export", f"Exported {self.trend.point_count:,} points to:\n{fp}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
@@ -4930,7 +5503,12 @@ class PLCTrendTool(ctk.CTk):
                                            filetypes=[("CSV Files", "*.csv")], initialfile=f"trend_{ts}.csv")
         if not fp: return
         try:
-            labels = {k: self._tag_label(k, self.trend.tags) for k in self.trend.tags}
+            # Column title = alias with its address in brackets, or just the address
+            labels = {}
+            for k in self.trend.tags:
+                labels[k] = self._tag_label(k, self.trend.tags)
+                if k in self._aliases:
+                    labels[k] += f" ({self._address_label(k)})"
             self.trend.export_csv(fp, header_labels=labels)
             messagebox.showinfo("Export", f"Exported {self.trend.point_count:,} points to:\n{fp}")
         except Exception as e:
@@ -4943,7 +5521,15 @@ class PLCTrendTool(ctk.CTk):
         try:
             if self.trend.trending: self._stop_trend()
             meta = self.trend.import_pytrend(fp)
-            self._remap_imported_controllers(meta)
+            mapping = self._remap_imported_controllers(meta)
+            # Aliases and slot-style addresses saved with the file. An alias
+            # already set on a live controller is kept.
+            for src_key, alias in (meta.get("aliases") or {}).items():
+                if isinstance(alias, str) and alias.strip():
+                    self._aliases.setdefault(mapping.get(src_key, src_key), alias.strip())
+            for src_key, addr in (meta.get("addresses") or {}).items():
+                if isinstance(addr, str) and addr:
+                    self._addr_labels[mapping.get(src_key, src_key)] = addr
             self.view_mode = "historical"
             self._follow_live = False
             # Set selected_tags from imported data so _get_ordered_tags works
@@ -4996,6 +5582,7 @@ class PLCTrendTool(ctk.CTk):
                 self._ctrl_meta[target] = dict(m)
             mapping[key] = make_key(target, raw)
         self.trend.rename_tags(mapping)
+        return mapping
 
     # == THEME ==
     def _on_theme_selected(self, value):
