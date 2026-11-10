@@ -177,6 +177,10 @@ The included build script handles PyInstaller configuration, asset bundling, and
 
 ### Build Steps
 
+**Quick way:** double-click `build.cmd` in the source folder you want to build (`Source Code v… (x64)` or `Source Code v… (ARM64)`). It finds the installed Python that matches the folder (x64 or ARM64), installs the dependencies including `pycomm3`, and runs `build.py`. `Build_All.cmd` in the `Source Code` folder builds both, one after the other. Both Pythons must be installed on the build PC to build both versions.
+
+**By hand:**
+
 ```bash
 pip install -r requirements.txt
 pip install pycomm3    # Required for SLC 500/MicroLogix/PLC-5 support in the .exe
