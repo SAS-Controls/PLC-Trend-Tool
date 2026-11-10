@@ -261,6 +261,13 @@ SLC_INTEGER_WORD_TYPES = {"O", "I", "S", "N", "B"}
 # Controller type whose I/O image is addressed by rack slot (I:3.0, O:2.0)
 SLC_SLOT_IO_TYPE = "SLC 500 / MicroLogix"
 
+# -- Trend setup files --
+# A setup file holds everything needed to repeat a trend on another PC:
+# controllers, tags, aliases, scaling, line styles, sample rate, chart options.
+SETUP_EXT = ".trendsetup"
+SETUP_FILE_TYPE = "PLC Trend Tool Setup"
+SAMPLE_RATES = ["100 ms", "250 ms", "500 ms", "1 sec", "2 sec", "5 sec", "10 sec", "30 sec", "60 sec"]
+
 # -- Multi-controller --
 CONTROLLER_TYPES = ["ControlLogix", "CompactLogix", "Micro800", "SLC 500 / MicroLogix", "PLC-5"]
 MAX_CONTROLLERS = 8
@@ -634,7 +641,10 @@ class PLCManager:
             nonlocal total_probes
             total_probes += 1
             try:
-                result = self.comm.read(addr)
+                # Lock per read so a trend started during the scan (e.g. right
+                # after opening a setup file) shares the connection safely
+                with self._lock:
+                    result = self.comm.read(addr)
                 return result.error is None
             except Exception:
                 return False
@@ -1354,6 +1364,8 @@ class PLCTrendTool(ctk.CTk):
         self._aliases = {}              # trend key -> alias shown instead of the address
         self._addr_labels = {}          # trend key -> slot-style address from an imported file
         self._table_keys = []           # trend key of each live-table row, top to bottom
+        self._pending_setup = {}        # cid -> tags from an opened setup file, applied on connect
+        self._setup_order = {}          # trend key -> display position from the setup file
         self.view_mode = "live"
 
         # Smart cursor state
@@ -1815,7 +1827,7 @@ class PLCTrendTool(ctk.CTk):
         tk.Label(inner, text="Rate:", font=tb_font, fg=tb_fg, bg=tb_bg).pack(side="left", padx=(4, 2))
         self.rate_var = ctk.StringVar(value="1 sec")
         ctk.CTkOptionMenu(inner, variable=self.rate_var,
-                          values=["100 ms", "250 ms", "500 ms", "1 sec", "2 sec", "5 sec", "10 sec", "30 sec", "60 sec"],
+                          values=SAMPLE_RATES,
                           font=tb_font, fg_color=BG_CARD, button_color=SAS_BLUE,
                           button_hover_color=SAS_BLUE_DARK, dropdown_fg_color=BG_MEDIUM, width=85, height=22).pack(side="left", padx=(0, 4))
 
@@ -1839,6 +1851,20 @@ class PLCTrendTool(ctk.CTk):
                             command=self._new_session, cursor="hand2",
                             highlightthickness=0)
         new_btn.pack(side="left", padx=(0, 4))
+
+        # Separator
+        tk.Frame(inner, bg=tb_border, width=1).pack(side="left", fill="y", padx=4, pady=2)
+
+        # Trend setup files — save the whole trend configuration, open it later / elsewhere
+        tk.Label(inner, text="Setup:", font=tb_font, fg=resolve_color(TEXT_MUTED), bg=tb_bg).pack(side="left", padx=(0, 2))
+        for text, cmd, tip in [("Open", self._open_setup, "Open a saved trend setup (controllers, tags, scaling, settings)"),
+                               ("Save", self._save_setup, "Save this trend setup to a file you can reopen or send to someone")]:
+            b = tk.Button(inner, text=text, font=tb_font, bg=tb_bg, fg=tb_fg,
+                          activebackground=tb_hover, activeforeground=resolve_color(TEXT_PRIMARY),
+                          bd=1, relief="solid", padx=5, pady=0, command=cmd,
+                          cursor="hand2", highlightthickness=0)
+            b.pack(side="left", padx=(0, 2))
+            self._add_tooltip(b, tip)
 
         # Separator
         tk.Frame(inner, bg=tb_border, width=1).pack(side="left", fill="y", padx=4, pady=2)
@@ -3774,6 +3800,7 @@ class PLCTrendTool(ctk.CTk):
             self._ctrl_names[cid] = sess.label
             self._ctrl_meta[cid] = dict(sess.meta)
             self._load_aliases(sess)
+            self._apply_pending_setup(sess)
             ui["btn"].configure(state="normal", text="Disconnect", fg_color=STATUS_ERROR, hover_color="#b91c1c")
             ui["badge"].configure(fg_color=STATUS_GOOD)
             self._set_row_status(sess, self._row_connected_text(sess), STATUS_GOOD)
@@ -3790,6 +3817,14 @@ class PLCTrendTool(ctk.CTk):
             ui["btn"].configure(state="normal", text="Connect", fg_color=SAS_BLUE, hover_color=SAS_BLUE_DARK)
             ui["badge"].configure(fg_color=STATUS_OFFLINE)
             self._set_row_status(sess, message, STATUS_ERROR)
+            if self._pending_setup.get(cid):
+                # The setup's tags are still waiting for this controller
+                self._show_connect_view()
+                messagebox.showwarning(
+                    "Trend Setup",
+                    f"Could not connect to {sess.label} at {ui['ip'].get().strip()}:\n{message}\n\n"
+                    "Check the IP address on this page and click Connect. "
+                    "The tags from the setup file load as soon as it connects.")
         self._update_row_controls()
 
     def _row_connected_text(self, sess, extra=""):
@@ -4112,6 +4147,11 @@ class PLCTrendTool(ctk.CTk):
         if sess.search_text:
             self._filter_tags(sess)
         self._update_selected_count()
+        if any(split_key(k)[0] == cid for k in self.selected_tags):
+            # Tags were already on the chart (setup file / import); their
+            # addresses may read differently now that the scan is done
+            self._rebuild_chart()
+            self._update_live_table()
 
     def _insert_tag_item(self, sess, parent, tag, full_path, display_name=None):
         """Insert a tag into a controller's tree. Struct tags get a dummy child for the expand arrow."""
@@ -4613,10 +4653,14 @@ class PLCTrendTool(ctk.CTk):
         return f"{self.ALIAS_SEP}{alias}" if alias else ""
 
     @staticmethod
-    def _store_id(sess):
+    def _store_id_for(ip, slot, controller_type):
         """Settings key for a controller: its IP, plus the slot for Logix."""
+        return ip if controller_type in SLC_CONTROLLER_TYPES else f"{ip}/{slot}"
+
+    @classmethod
+    def _store_id(cls, sess):
         p = sess.plc
-        return p.ip if p.controller_type in SLC_CONTROLLER_TYPES else f"{p.ip}/{p.slot}"
+        return cls._store_id_for(p.ip, p.slot, p.controller_type)
 
     def _load_aliases(self, sess):
         """Bring a controller's saved aliases into the session on connect."""
@@ -5290,6 +5334,9 @@ class PLCTrendTool(ctk.CTk):
         self.tag_data_types.clear()
         live_cids = {s.cid for s in self._connected_sessions()}
         self._aliases = {k: v for k, v in self._aliases.items() if split_key(k)[0] in live_cids}
+        self._pending_setup.clear()
+        self._setup_order.clear()
+        self.title(APP_FULL_NAME)
         self._addr_labels.clear()
         self._tag_scales.clear()
         self._line_props.clear()
@@ -5584,6 +5631,263 @@ class PLCTrendTool(ctk.CTk):
         self.trend.rename_tags(mapping)
         return mapping
 
+    # == TREND SETUP FILES ==
+    def _build_setup(self):
+        """Everything needed to repeat the current trend, as a plain dict."""
+        ordered = [k for k in self._get_ordered_tags() if split_key(k)[0] is not None]
+        controllers, tags = [], []
+        seen = {}
+        for idx, key in enumerate(ordered):
+            cid, tag = split_key(key)
+            if cid not in seen:
+                meta = dict(self._ctrl_meta.get(cid, {}))
+                sess = self.sessions.get(cid)
+                entry = {"id": cid, "name": self._ctrl_label(cid), "type": meta.get("type", "ControlLogix"),
+                         "ip": meta.get("ip", ""), "slot": meta.get("slot", 0) or 0}
+                if sess is not None and sess.plc.slc_io_layouts:
+                    entry["ioLayouts"] = {ft: format_slc_io_layout(layout)
+                                          for ft, layout in sess.plc.slc_io_layouts.items()}
+                seen[cid] = entry
+                controllers.append(entry)
+            scale = self._tag_scales.get(key, {"auto": True, "min": 0, "max": 100})
+            item = {"controller": cid, "tag": tag,
+                    "type": self.tag_data_types.get(key, "---"),
+                    "scale": {"auto": bool(scale.get("auto", True)),
+                              "min": scale.get("min", 0), "max": scale.get("max", 100)},
+                    "line": self._get_line_props(key, idx)}
+            if key in self._aliases:
+                item["alias"] = self._aliases[key]
+            if key in self._chart_bg:
+                item["background"] = self._chart_bg[key]
+            tags.append(item)
+        return {
+            "fileType": SETUP_FILE_TYPE, "version": "1.0", "appVersion": APP_VERSION,
+            "savedAt": datetime.now().isoformat(timespec="seconds"),
+            "sampleRate": self.rate_var.get(),
+            "chart": {
+                "timeSpanSeconds": self._time_span_seconds,
+                "isolated": self._isolated_mode,
+                "scaleMode": self._scale_mode,
+                "showLegend": self._show_legend,
+                "showXScale": self._show_x_scale,
+                "showXGrid": self._show_x_grid,
+                "allowScrolling": self._allow_scrolling,
+                "smartCursor": self._cursor_enabled,
+                "chartZoom": self._chart_zoom,
+            },
+            "controllers": controllers,
+            "tags": tags,
+        }
+
+    def _save_setup(self):
+        setup = self._build_setup()
+        if not setup["tags"]:
+            messagebox.showwarning("Save Trend Setup", "Select the tags you want to trend first, then save the setup.")
+            return
+        fp = filedialog.asksaveasfilename(title="Save Trend Setup", defaultextension=SETUP_EXT,
+                                          filetypes=[("PLC Trend Setup", f"*{SETUP_EXT}"), ("All Files", "*.*")],
+                                          initialfile=f"trend_setup{SETUP_EXT}")
+        if not fp:
+            return
+        try:
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(setup, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Save Trend Setup", str(e))
+            return
+        self.title(f"{APP_FULL_NAME}  —  {os.path.basename(fp)}")
+        n, c = len(setup["tags"]), len(setup["controllers"])
+        messagebox.showinfo("Save Trend Setup",
+                            f"Saved {n} tag{'s' if n != 1 else ''} on {c} controller{'s' if c != 1 else ''}, "
+                            f"with scaling, aliases, sample rate and chart settings, to:\n{fp}")
+
+    def _open_setup(self):
+        fp = filedialog.askopenfilename(title="Open Trend Setup",
+                                        filetypes=[("PLC Trend Setup", f"*{SETUP_EXT}"), ("All Files", "*.*")])
+        if fp:
+            self._open_setup_file(fp)
+
+    def _open_setup_file(self, fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                setup = json.load(f)
+            if not isinstance(setup, dict) or setup.get("fileType") != SETUP_FILE_TYPE:
+                if isinstance(setup, dict) and "data" in setup and "metadata" in setup:
+                    raise ValueError("This is a trend data file. Use Import to open it.")
+                raise ValueError("This is not a PLC Trend Tool setup file.")
+            if not setup.get("tags") or not setup.get("controllers"):
+                raise ValueError("The setup file has no tags in it.")
+        except Exception as e:
+            messagebox.showerror("Open Trend Setup", f"Could not open the setup file.\n\n{e}")
+            return False
+        return self._apply_setup(setup, fp)
+
+    def _apply_setup(self, setup, fp=""):
+        """Replace the current session with the one described by a setup
+        file: connection rows, chart settings, then connect; each controller's
+        tags, scaling and line styles are applied as it comes online."""
+        if any(s.state == "connecting" for s in self.sessions.values()):
+            messagebox.showwarning("Open Trend Setup", "A controller is still connecting. Try again in a moment.")
+            return False
+        busy = self._connected_sessions() or self.trend.point_count or self.selected_tags
+        if busy and not messagebox.askyesno(
+                "Open Trend Setup",
+                "Opening a setup closes the current connections and clears the current trend.\n\n"
+                "Export the trend first if you need the data.\n\nContinue?"):
+            return False
+
+        # 1. Clean slate
+        self._disconnect_all()
+        self._new_session()
+        for cid in list(self.sessions):
+            self.sessions[cid].ui["row"].destroy()
+            del self.sessions[cid]
+        self._next_cid = 1
+        self._ctrl_names.clear()
+        self._ctrl_meta.clear()
+
+        # 2. Controllers -> connection rows (new ids), remembering the mapping
+        id_map = {}
+        for c in setup.get("controllers", [])[:MAX_CONTROLLERS]:
+            if not isinstance(c, dict):
+                continue
+            try: slot = int(c.get("slot") or 0)
+            except (TypeError, ValueError): slot = 0
+            ctype = c.get("type") if c.get("type") in CONTROLLER_TYPES else "ControlLogix"
+            ip = str(c.get("ip") or "").strip()
+            name = str(c.get("name") or "").strip()
+            sess = self._add_controller_row({"name": name, "type": ctype, "ip": ip, "slot": slot})
+            if sess is None:
+                break
+            id_map[str(c.get("id"))] = (sess.cid, ip, slot, ctype)
+            self._ctrl_names[sess.cid] = name or f"PLC {sess.cid}"
+            # SLC slot layout saved with the setup, so addresses read the same here
+            layouts = c.get("ioLayouts")
+            if ip and isinstance(layouts, dict):
+                clean = {}
+                for ft in ("I", "O"):
+                    try:
+                        if layouts.get(ft):
+                            clean[ft] = format_slc_io_layout(parse_slc_io_layout(layouts[ft]))
+                    except ValueError:
+                        pass
+                if clean:
+                    store = self.settings.get("slc_io_layouts")
+                    if not isinstance(store, dict):
+                        store = self.settings["slc_io_layouts"] = {}
+                    store.setdefault(self._store_id_for(ip, slot, ctype), {}).update(clean)
+        if not self.sessions:
+            self._add_controller_row()
+
+        # 3. Tags wait per controller until it connects; aliases go to the
+        #    settings file so they load with the controller
+        self._pending_setup, self._setup_order = {}, {}
+        alias_store = self.settings.get("tag_aliases")
+        if not isinstance(alias_store, dict):
+            alias_store = self.settings["tag_aliases"] = {}
+        for idx, t in enumerate(setup.get("tags", [])):
+            if not isinstance(t, dict) or not t.get("tag") or str(t.get("controller")) not in id_map:
+                continue
+            cid, ip, slot, ctype = id_map[str(t.get("controller"))]
+            tag = str(t["tag"])
+            self._pending_setup.setdefault(cid, []).append(t)
+            self._setup_order[make_key(cid, tag)] = idx
+            sid = self._store_id_for(ip, slot, ctype)
+            alias = " ".join(str(t.get("alias") or "").split())[:60]
+            if alias:
+                alias_store.setdefault(sid, {})[tag] = alias
+            elif sid in alias_store:
+                alias_store[sid].pop(tag, None)   # the setup shows this tag by address
+
+        # 4. Sample rate and chart settings
+        if setup.get("sampleRate") in SAMPLE_RATES:
+            self.rate_var.set(setup["sampleRate"])
+        ch = setup.get("chart") if isinstance(setup.get("chart"), dict) else {}
+        try: self._time_span_seconds = max(1, int(ch.get("timeSpanSeconds", self._time_span_seconds)))
+        except (TypeError, ValueError): pass
+        self._isolated_mode = bool(ch.get("isolated", self._isolated_mode))
+        if ch.get("scaleMode") in ("same", "independent"):
+            self._scale_mode = ch["scaleMode"]
+        self._show_legend = bool(ch.get("showLegend", self._show_legend))
+        self._show_x_scale = bool(ch.get("showXScale", self._show_x_scale))
+        self._show_x_grid = bool(ch.get("showXGrid", self._show_x_grid))
+        self._allow_scrolling = bool(ch.get("allowScrolling", self._allow_scrolling))
+        self._cursor_enabled = bool(ch.get("smartCursor", self._cursor_enabled))
+        if hasattr(self, "_cursor_switch_var"):
+            self._cursor_switch_var.set(self._cursor_enabled)
+        try: zoom = float(ch.get("chartZoom", 1.0))
+        except (TypeError, ValueError): zoom = 1.0
+        self._chart_zoom = zoom if self._isolated_mode and 1.0 <= zoom <= 5.0 else 1.0
+        try: self._chart_zoom_var.set(self._chart_zoom)
+        except Exception: pass
+        self.settings.update({
+            "time_span": self._time_span_seconds, "isolated_mode": self._isolated_mode,
+            "scale_mode": self._scale_mode, "smart_cursor": self._cursor_enabled,
+            "show_legend": self._show_legend, "show_x_scale": self._show_x_scale,
+            "show_x_grid": self._show_x_grid, "allow_scrolling": self._allow_scrolling,
+        })
+        self._save_current_settings()
+
+        # 5. Show it and connect
+        self.title(f"{APP_FULL_NAME}  —  {os.path.basename(fp)}" if fp else APP_FULL_NAME)
+        self._rebuild_chart()
+        self._update_live_table()
+        self._show_trend_view()
+        missing_ip = []
+        for cid, sess in list(self.sessions.items()):
+            if not self._pending_setup.get(cid):
+                continue
+            if sess.ui["ip"].get().strip():
+                self._toggle_controller(cid)
+            else:
+                missing_ip.append(self._ctrl_names.get(cid, f"PLC {cid}"))
+        if missing_ip:
+            self._show_connect_view()
+            messagebox.showinfo("Open Trend Setup",
+                                "Enter the IP address for " + ", ".join(missing_ip) +
+                                " and click Connect. The tags from the setup load when it connects.")
+        return True
+
+    def _apply_pending_setup(self, sess):
+        """A controller named in the opened setup just connected: put its
+        tags on the chart with their saved scaling and line styles."""
+        items = self._pending_setup.pop(sess.cid, None)
+        if not items:
+            return
+        for t in items:
+            key = make_key(sess.cid, str(t["tag"]))
+            self.selected_tags.add(key)
+            self.tag_data_types[key] = str(t.get("type") or "---")
+            sc = t.get("scale") if isinstance(t.get("scale"), dict) else {}
+            try:
+                mn, mx = float(sc.get("min", 0)), float(sc.get("max", 100))
+            except (TypeError, ValueError):
+                mn, mx = 0.0, 100.0
+            if mn >= mx:
+                mx = mn + 1
+            self._tag_scales[key] = {"auto": bool(sc.get("auto", True)), "min": mn, "max": mx}
+            ln = t.get("line") if isinstance(t.get("line"), dict) else {}
+            props = {}
+            if isinstance(ln.get("color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", ln["color"]):
+                props["color"] = ln["color"]
+            try: props["width"] = min(max(float(ln.get("width", 1.5)), 0.5), 10.0)
+            except (TypeError, ValueError): pass
+            if ln.get("style") in ("-", "--", ":", "-."):
+                props["style"] = ln["style"]
+            if props:
+                self._line_props[key] = props
+            bg = t.get("background")
+            if isinstance(bg, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", bg):
+                self._chart_bg[key] = bg
+        # Keep the chart order saved in the file, across controllers
+        big = len(self._setup_order) + 1
+        present = [k for k in self._tag_order if k in self.selected_tags]
+        present += [k for k in self.selected_tags if k not in present]
+        self._tag_order = sorted(present, key=lambda k: (self._setup_order.get(k, big), k))
+        self._update_selected_count()
+        self._sync_tags_to_chart()
+        self._update_live_table()
+
     # == THEME ==
     def _on_theme_selected(self, value):
         self.settings["theme"] = value
@@ -5718,4 +6022,7 @@ class PLCTrendTool(ctk.CTk):
 # =========================================================================
 if __name__ == "__main__":
     app = PLCTrendTool()
+    # A setup file dropped on the .exe (or passed as an argument) opens at startup
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(SETUP_EXT) and os.path.isfile(sys.argv[1]):
+        app.after(500, lambda: app._open_setup_file(sys.argv[1]))
     app.mainloop()

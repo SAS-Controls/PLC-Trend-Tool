@@ -76,6 +76,12 @@ No Python, no drivers, no admin rights required. Single `.exe`, fully portable.
 - The data table keeps the real address in its own **Address** column, and CSV column titles read `Alias (address)`
 - Aliases are saved per controller (by IP address) and come back the next time you connect; they are also stored in `.pytrend` files
 
+### Trend Setup Files
+- **Setup: Save** stores the whole trend configuration in a `.trendsetup` file: controllers (name, type, IP, slot), selected tags and their chart order, aliases, per-tag scaling, line color/width/style and chart backgrounds, sample rate, time span, overlay/isolated mode, and the display options
+- **Setup: Open** rebuilds that session on any PC: it fills in the connection rows, connects, and puts the same tags on the chart with the same settings — click **Start Trend** and go
+- Built for remote support: set up the trend, send the file to the customer, they open it, run it, and send back the exported `.pytrend`
+- A `.trendsetup` file dropped onto `PLC_Trend_Tool.exe` opens at startup
+
 ### Real-Time Trending
 - Background polling thread at configurable sample rates (100 ms to 60 sec)
 - Matplotlib chart with auto-scaling, zoom, and horizontal pan
@@ -287,6 +293,15 @@ The alias replaces the address on the chart, legend, cursor read-out, and table.
 **Timers, Counters, and Controls** expand to show their sub-elements (`.ACC`, `.PRE`, `.DN`, `.EN`, etc.) with trendable numeric values and status bits.
 
 **Float (F) and Long Integer (L) files** show directly as trendable values without expansion.
+
+### Saving and Reopening a Trend Setup
+
+1. Connect, pick your tags, and set everything the way you want it (aliases, scaling, line styles, sample rate, chart options)
+2. Click **Save** next to **Setup:** on the toolbar and choose where to put the `.trendsetup` file
+3. Later — or on another PC — click **Open** next to **Setup:** and pick the file. The tool closes any current connections, fills in the controllers from the file, connects to them, and loads the tags with their saved settings
+4. Click **▶ Start Trend**
+
+If a controller can't be reached (for example its IP address is different on site), the tool shows the PLC Connection page. Correct the IP address and click **Connect**; the saved tags load as soon as it connects. A setup file holds no trend data — use **Export** for that.
 
 ### Starting a New Session
 
